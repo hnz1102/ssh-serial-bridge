@@ -1,0 +1,29 @@
+[ssh-serial-bridge]
+wifi_ssid      = "your-ssid"
+wifi_psk       = "your-password"
+ip_mode        = "dhcp"           # "dhcp" or "static"
+ip_address     = "192.168.2.200"
+subnet_mask    = "255.255.255.0"
+gateway        = "192.168.2.1"
+dns            = "1.1.1.1"
+
+syslog_server    = "192.168.2.140:514"
+syslog_enable    = "false"
+syslog_host_name = "esp32s3"
+syslog_app_name  = "ssh-bridge"
+
+ssh_user     = "admin"
+ssh_password = "esp32"
+
+com1_tx_pin = "43"    # XIAO-ESP32S3
+com1_rx_pin = "44"
+com1_baud   = "115200"
+com2_tx_pin = "41"
+com2_rx_pin = "42"
+com2_baud   = "115200"
+
+cdc_enable = "false"
+cdc_baud   = "115200"
+
+display_enable = "false"
+display_port   = "com1"    # "com1" / "com2" / "usb"

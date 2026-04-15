@@ -1,0 +1,9 @@
+format = "EspIdf"
+
+[idf_format_args]
+partition_table = "partitions.csv"
+
+[flash]
+mode = "dio"
+size = "8MB"
+frequency = "40MHz"
