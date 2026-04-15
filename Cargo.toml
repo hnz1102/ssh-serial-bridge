@@ -36,5 +36,5 @@ embuild = "0.31.3"
 anyhow = "1"
 
 [[package.metadata.esp-idf-sys.extra_components]]
-component_dirs = ["/home/nodeadmin/esp32/esp32-s3/ssh-serial-bridge/components"]
+component_dirs = ["components"]
 
