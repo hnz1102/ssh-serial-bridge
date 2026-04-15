@@ -156,6 +156,8 @@ extern void ssh_log_info(const char *msg);
 extern void ssh_log_warn(const char *msg);
 extern void ssh_log_hex(const char *dir, const uint8_t *data, size_t len);
 extern const char *ssh_device_error(void);
+extern ssh_cdc_tx_cb_t ssh_select_device(const char *name);
+extern void ssh_release_device(const char *name);
 
 /* ── SSH session handler task ────────────────────────────────────────────── */
 
