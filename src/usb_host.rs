@@ -91,7 +91,7 @@ static WS_FD_PORT_MAP: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Per-port ring buffers for WS data (RX paths write here, sender thread drains).
-const WS_RING_CAP: usize = 4096;
+const WS_RING_CAP: usize = 65536;
 static WS_RING_COM1: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_RING_COM2: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_RING_USB:  std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
@@ -206,7 +206,7 @@ fn ws_drain_and_send(device_id: u8) {
 }
 
 /// Background thread: drains per-port WS ring buffers and sends to clients.
-/// Also drains TX queues (browser→serial). Runs ~50 Hz so latency is ≤20 ms.
+/// Also drains TX queues (browser→serial). Runs ~200 Hz so latency is ≤5 ms.
 pub fn start_ws_sender_thread() {
     thread::Builder::new()
         .name("ws_send".into())
@@ -219,7 +219,7 @@ pub fn start_ws_sender_thread() {
                 ws_drain_tx(DEVICE_COM1);
                 ws_drain_tx(DEVICE_COM2);
                 ws_drain_tx(DEVICE_USB0);
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(Duration::from_millis(5));
             }
         })
         .expect("spawn ws_sender thread");
@@ -1505,19 +1505,19 @@ unsafe fn uart_init(port_num: i32, tx_pin: i32, rx_pin: i32, baud_rate: u32) -> 
         rx_flow_ctrl_thresh: 0,
         ..core::mem::zeroed()
     };
-    let rc = uart_param_config(port_num as u32, &cfg);
+    let rc = uart_param_config(port_num, &cfg);
     if rc != 0 {
         log::warn!("[UART{}] uart_param_config failed: {}", port_num, rc);
         return false;
     }
     // -1 = UART_PIN_NO_CHANGE; no RTS/CTS needed
-    let rc = uart_set_pin(port_num as u32, tx_pin, rx_pin, -1, -1);
+    let rc = uart_set_pin(port_num, tx_pin, rx_pin, -1, -1);
     if rc != 0 {
         log::warn!("[UART{}] uart_set_pin failed: {}", port_num, rc);
         return false;
     }
-    // RX buffer 512 B, no TX buffer (direct write), no event queue
-    let rc = uart_driver_install(port_num as u32, 512, 0, 0, core::ptr::null_mut(), 0);
+    // RX buffer 8192 B, no TX buffer (direct write), no event queue
+    let rc = uart_driver_install(port_num, 8192, 0, 0, core::ptr::null_mut(), 0);
     if rc != 0 {
         log::warn!("[UART{}] uart_driver_install failed: {}", port_num, rc);
         return false;
@@ -1531,14 +1531,14 @@ unsafe fn uart_init(port_num: i32, tx_pin: i32, rx_pin: i32, baud_rate: u32) -> 
 /// Reads from `port_num` with a 10-tick timeout.  When `ACTIVE_DEVICE ==
 /// device_id`, the received bytes are forwarded to the SSH bridge ring buffer.
 fn uart_rx_thread(port_num: i32, device_id: u8) {
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 1024];
     loop {
         let n = unsafe {
             uart_read_bytes(
-                port_num as u32,
+                port_num,
                 buf.as_mut_ptr() as *mut core::ffi::c_void,
                 buf.len() as u32,
-                10,  // ticks; ~100 ms at 100 Hz FreeRTOS tick rate
+                1,  // ticks; ~10 ms at 100 Hz FreeRTOS tick rate
             )
         };
         if n > 0 {

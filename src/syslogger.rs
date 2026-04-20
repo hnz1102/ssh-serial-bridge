@@ -227,6 +227,22 @@ impl std::fmt::Display for LoggerError {
     }
 }
 
+// Update logger configuration (hostname and app_name) without re-initializing the socket
+pub fn update_logger_config(host_name: &str, app_name: &str) -> Result<(), LoggerError> {
+    let mut guard = SYSLOGGER.lock().map_err(|_| {
+        eprintln!("Failed to acquire lock on logger mutex");
+        LoggerError::LockError
+    })?;
+    
+    if let Some(logger) = guard.as_mut() {
+        logger.host_name = host_name.to_string();
+        logger.app_name = app_name.to_string();
+        eprintln!("Syslog config updated: hostname={}, app_name={}", host_name, app_name);
+    }
+    
+    Ok(())
+}
+
 // Initialize the syslogger with improved error handling
 pub fn init_logger(syslog_server: &str, syslog_enable: &str, host_name: &str, app_name: &str) -> Result<(), LoggerError> {
     if syslog_enable != "true" {

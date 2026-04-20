@@ -273,6 +273,7 @@ pub struct StatusInfo {
     pub rssi:           Arc<Mutex<i32>>,
     pub dc_in_voltage:  Arc<Mutex<f32>>,
     pub dc_out_voltage: Arc<Mutex<f32>>,
+    pub chip_temp:      Arc<Mutex<f32>>,
 }
 
 impl StatusInfo {
@@ -283,6 +284,7 @@ impl StatusInfo {
             rssi:           Arc::new(Mutex::new(0)),
             dc_in_voltage:  Arc::new(Mutex::new(0.0)),
             dc_out_voltage: Arc::new(Mutex::new(0.0)),
+            chip_temp:      Arc::new(Mutex::new(0.0)),
         }
     }
     pub fn set_wifi(&self, ip: &str, ssid: &str, rssi: i32) {
@@ -296,6 +298,9 @@ impl StatusInfo {
     pub fn set_voltages(&self, dc_in: f32, dc_out: f32) {
         *self.dc_in_voltage.lock().unwrap()  = dc_in;
         *self.dc_out_voltage.lock().unwrap() = dc_out;
+    }
+    pub fn set_chip_temp(&self, temp: f32) {
+        *self.chip_temp.lock().unwrap() = temp;
     }
 }
 
@@ -469,6 +474,20 @@ hr{{border:none;border-top:1px solid #1e3a5f;margin:10px 0}}
     <a href="/gpio" class="btn-gpio">&#x26A1; GPIO/PWM</a>
     <a href="/terminal" class="btn-gpio" style="background:#7c3aed">&#x1F4BB; Terminal</a>
     <a href="/logout" class="btn-logout">&#x1F6AA; Logout</a>
+    <button type="button" class="btn" style="background:#0e7490" onclick="showBootLog()">&#x1F4DC; Boot Log</button>
+  </div>
+</div>
+
+<!-- Boot Log Modal -->
+<div id="boot-log-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;align-items:center;justify-content:center">
+  <div style="background:#1e2d45;border:1px solid #243b55;border-radius:12px;padding:20px 24px;max-width:480px;width:90%;max-height:80vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.6)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <span style="color:#93c5fd;font-weight:700;font-size:.95em;text-transform:uppercase;letter-spacing:.08em">&#x1F4DC; Boot Log</span>
+      <button onclick="closeBootLog()" style="background:none;border:none;color:#94a3b8;font-size:1.4em;cursor:pointer;line-height:1">&times;</button>
+    </div>
+    <div id="boot-log-body" style="font-size:.88em;color:#e2e8f0;line-height:1.7">
+      <span style="color:#64748b">Loading...</span>
+    </div>
   </div>
 </div>
 
@@ -511,7 +530,7 @@ hr{{border:none;border-top:1px solid #1e3a5f;margin:10px 0}}
     <div class="field" style="grid-column:1/-1"><label>Server (host:port)</label>
       <input type="text" name="syslog_server" value="{syslog_server}" placeholder="192.168.1.1:514"></div>
     <div class="field"><label>Host Name</label>
-      <input type="text" name="syslog_host_name" value="{syslog_host_name}" placeholder="esp32"></div>
+      <input type="text" name="syslog_hostname" value="{syslog_host_name}" placeholder="esp32"></div>
     <div class="field"><label>App Name</label>
       <input type="text" name="syslog_app_name" value="{syslog_app_name}" placeholder="app"></div>
   </div>
@@ -656,6 +675,7 @@ function updateStatus() {{
       '<span class="stat-key">RSSI</span><span class="stat-val">' + rssiBar(d.rssi) + '</span>' +
       '<span class="stat-key">DC In Voltage</span><span class="stat-val"><span class="badge badge-ok">' + d.dc_in_voltage.toFixed(2) + ' V</span></span>' +
       '<span class="stat-key">DC Out Voltage</span><span class="stat-val"><span class="badge badge-ok">' + d.dc_out_voltage.toFixed(2) + ' V</span></span>' +
+      '<span class="stat-key">Chip Temp</span><span class="stat-val"><span class="badge ' + (d.chip_temp < 70 ? 'badge-ok' : d.chip_temp < 85 ? 'badge-warn' : 'badge-err') + '">' + d.chip_temp.toFixed(1) + ' °C</span></span>' +
       '<span class="stat-key">USB CDC</span><span class="stat-val">' + usb + '</span>' +
       '<span class="stat-key">Active Device</span><span class="stat-val">' + dev + '</span>' +
       '<span class="stat-key">Display Port</span><span class="stat-val"><span class="badge badge-ok">' + d.display_port + '</span></span>';
@@ -664,6 +684,53 @@ function updateStatus() {{
 }}
 updateStatus();
 setInterval(updateStatus, 3000);
+function showBootLog() {{
+  var overlay = document.getElementById('boot-log-overlay');
+  overlay.style.display = 'flex';
+  document.getElementById('boot-log-body').innerHTML = '<span style="color:#64748b">Loading...</span>';
+  fetch('/api/boot_log')
+  .then(r => r.json())
+  .then(d => {{
+    if (!d.entries || d.entries.length === 0) {{
+      document.getElementById('boot-log-body').innerHTML = '<span style="color:#64748b">No entries yet.</span>';
+      return;
+    }}
+    var reasons = {{
+      'PowerOn':     ['badge-ok',   '&#x1F50C; PowerOn'],
+      'Software':    ['badge-ok',   '&#x1F501; Software'],
+      'Panic/Crash': ['badge-err',  '&#x1F4A5; Panic/Crash'],
+      'IntWatchdog': ['badge-err',  '&#x231B; IntWatchdog'],
+      'TaskWatchdog':['badge-warn', '&#x231B; TaskWatchdog'],
+      'Watchdog':    ['badge-warn', '&#x231B; Watchdog'],
+      'Brownout':    ['badge-err',  '&#x26A1; Brownout'],
+      'DeepSleep':   ['badge-ok',   '&#x1F4A4; DeepSleep'],
+      'ExtReset':    ['badge-ok',   '&#x1F504; ExtReset'],
+      'SDIO':        ['badge-warn', '&#x1F4BE; SDIO'],
+    }};
+    var html = '<table style="width:100%;border-collapse:collapse">' +
+      '<tr><th style="text-align:left;color:#475569;font-size:.75em;padding-bottom:6px;border-bottom:1px solid #243b55">#</th>' +
+      '<th style="text-align:left;color:#475569;font-size:.75em;padding-bottom:6px;border-bottom:1px solid #243b55;padding-left:10px">Reset Reason</th></tr>';
+    d.entries.forEach(function(e) {{
+      var m = e.match(/^#(\d+)\s+(.+)$/);
+      if (!m) return;
+      var num = m[1], reason = m[2].trim();
+      var info = reasons[reason] || ['badge-warn', reason];
+      html += '<tr><td style="padding:5px 0;color:#64748b;font-size:.85em;vertical-align:top">' + num + '</td>' +
+        '<td style="padding:5px 0 5px 10px"><span class="badge ' + info[0] + '">' + info[1] + '</span></td></tr>';
+    }});
+    html += '</table>';
+    document.getElementById('boot-log-body').innerHTML = html;
+  }})
+  .catch(e => {{
+    document.getElementById('boot-log-body').innerHTML = '<span style="color:#fca5a5">Failed to load: ' + e + '</span>';
+  }});
+}}
+function closeBootLog() {{
+  document.getElementById('boot-log-overlay').style.display = 'none';
+}}
+document.getElementById('boot-log-overlay').addEventListener('click', function(e) {{
+  if (e.target === this) closeBootLog();
+}});
 </script>
 </body></html>"#,
         wifi_ssid     = esc(&cfg.wifi_ssid),
@@ -955,6 +1022,11 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
         // Apply display port change immediately (no reboot needed)
         crate::usb_host::set_display_port(&cfg.display_port);
 
+        // Apply syslog hostname/app_name changes immediately (no reboot needed)
+        if let Err(e) = crate::syslogger::update_logger_config(&cfg.syslog_host_name, &cfg.syslog_app_name) {
+            warn!("Failed to update syslog config: {}", e);
+        }
+
         let ok = nvs_write_all(&cfg);
         drop(cfg);
 
@@ -984,18 +1056,20 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
         let rssi = *state_stat.status.rssi.lock().unwrap();
         let dc_in  = *state_stat.status.dc_in_voltage.lock().unwrap();
         let dc_out = *state_stat.status.dc_out_voltage.lock().unwrap();
+        let chip_temp = *state_stat.status.chip_temp.lock().unwrap();
         let (usb_connected, vid, pid) = crate::usb_host::cdc_device_info();
         let cdc_enabled  = crate::usb_host::cdc_is_enabled();
         let active_dev   = crate::usb_host::active_device_name();
         let chip_name    = crate::usb_host::cdc_device_chip_name();
         let usb_ports    = crate::usb_host::cdc_port_count();
         let json = format!(
-            r#"{{"ip":"{ip}","ssid":"{ssid}","rssi":{rssi},"dc_in_voltage":{dc_in:.2},"dc_out_voltage":{dc_out:.2},"cdc_enabled":{cdc_enabled},"usb_connected":{usb_connected},"usb_vid":"0x{vid:04X}","usb_pid":"0x{pid:04X}","usb_device":"{chip_name}","usb_ports":{usb_ports},"active_device":"{active_dev}","display_port":"{display_port}"}}"#,
+            r#"{{"ip":"{ip}","ssid":"{ssid}","rssi":{rssi},"dc_in_voltage":{dc_in:.2},"dc_out_voltage":{dc_out:.2},"chip_temp":{chip_temp:.1},"cdc_enabled":{cdc_enabled},"usb_connected":{usb_connected},"usb_vid":"0x{vid:04X}","usb_pid":"0x{pid:04X}","usb_device":"{chip_name}","usb_ports":{usb_ports},"active_device":"{active_dev}","display_port":"{display_port}"}}"#,
             ip          = esc(&ip),
             ssid        = esc(&ssid),
             rssi        = rssi,
             dc_in       = dc_in,
             dc_out      = dc_out,
+            chip_temp   = chip_temp,
             cdc_enabled = cdc_enabled,
             usb_connected = usb_connected,
             vid         = vid,
@@ -1197,6 +1271,27 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
         ];
         request.into_response(200, Some("OK"), &headers)?
             .write_all(include_bytes!("../static/xterm-addon-fit.min.js"))?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    // ── GET /api/boot_log — boot history from NVS (requires auth) ───────────
+    let state_bl = state.clone();
+    server.fn_handler("/api/boot_log", Method::Get, move |request| {
+        let cookie_hdr = request.header("Cookie").map(str::to_owned);
+        if !is_auth(cookie_hdr.as_deref(), &state_bl.session) {
+            request.into_status_response(401)?.write_all(b"Unauthorized")?;
+            return Ok::<(), anyhow::Error>(());
+        }
+        let log = crate::boot_log::read_log();
+        let entries: Vec<&str> = if log.is_empty() { Vec::new() } else { log.lines().collect() };
+        let json_entries = entries.iter()
+            .map(|e| format!("\"{}\"", e.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!("{{\"entries\":[{}]}}", json_entries);
+        let headers = [("Content-Type", "application/json")];
+        request.into_response(200, Some("OK"), &headers)?
+            .write_all(json.as_bytes())?;
         Ok::<(), anyhow::Error>(())
     })?;
 

@@ -9,6 +9,7 @@ use esp_idf_hal::{gpio::*, prelude::*};
 use esp_idf_hal::adc::attenuation::DB_11;
 use esp_idf_hal::adc::oneshot::{AdcDriver, AdcChannelDriver};
 use esp_idf_hal::adc::oneshot::config::AdcChannelConfig;
+use esp_idf_hal::temp_sensor::{TempSensorConfig, TempSensorDriver};
 use std::time::{Duration, SystemTime};
 use std::thread;
 
@@ -19,6 +20,7 @@ mod httpserver;
 mod gpio_ctrl;
 pub mod serial_display;
 mod btn_ctrl;
+mod boot_log;
 
 #[toml_cfg::toml_config]
 pub struct Config {
@@ -83,7 +85,9 @@ fn main() {
 
     // NVS flash init (required before WiFi for RF calibration data)
     unsafe { esp_idf_sys::nvs_flash_init(); }
-
+    // Record reset reason and boot count to NVS before anything else
+    let (boot_count, reset_reason) = boot_log::record_boot();
+    println!("Boot #{}, reset reason: {}", boot_count, reset_reason);
     // Load config from NVS (overrides cfg.toml defaults where NVS keys are set)
     let cfg_defaults = httpserver::NvsConfig {
         wifi_ssid:     CONFIG.wifi_ssid.to_string(),
@@ -330,6 +334,11 @@ fn main() {
     // ADC2 Channel 3 (GPIO14) init ─────────────────────────────────────────────
     let mut adc14_pin = AdcChannelDriver::new(&adc2, peripherals.pins.gpio14, &adc_config).unwrap();
 
+    // ── Internal temperature sensor init ──────────────────────────────────
+    let temp_cfg = TempSensorConfig::default();
+    let mut temp_sensor = TempSensorDriver::new(&temp_cfg, peripherals.temp_sensor).unwrap();
+    temp_sensor.enable().unwrap();
+
     let mut count = 0u32;
     loop {
         // ── Apply GPIO 4-9 desired state ──────────────────────────────────
@@ -353,7 +362,11 @@ fn main() {
             let dc_in_voltage : f32 =  adc2.read(&mut adc13_pin).unwrap() as f32/ 80.098; // Already adjusted conversion factor for voltage divider
             let dc_out_voltage : f32 =  adc2.read(&mut adc14_pin).unwrap() as f32 / 80.098; // Already adjusted conversion factor for voltage divider
             dev_status.set_voltages(dc_in_voltage, dc_out_voltage);
-            info!("ADC2 Channel 2 (GPIO13) voltage: {:.2} V, Channel 3 (GPIO14) voltage: {:.2} V", dc_in_voltage, dc_out_voltage);
+            let temp_str = match temp_sensor.get_celsius() {
+                Ok(t) => { dev_status.set_chip_temp(t); format!("{:.1} °C", t) },
+                Err(_) => "--".to_string(),
+            };
+            info!("Internal temp: {}, DCIN: {:.2} V, DCOUT: {:.2} V", temp_str, dc_in_voltage, dc_out_voltage);
         }
 
         // Check connection state via EspWifi before calling get_rssi(),

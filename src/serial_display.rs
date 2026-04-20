@@ -725,7 +725,7 @@ fn display_task(
         }
 
         force_full_redraw = false;
-        thread::sleep(std::time::Duration::from_millis(100));
+        thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -791,7 +791,7 @@ fn draw_info_page<D: DrawTarget<Color = Rgb565>>(
         .build();
 
     // Collect data
-    let (ip, ssid, rssi, dc_in, dc_out) = {
+    let (ip, ssid, rssi, dc_in, dc_out, chip_temp) = {
         let guard = DISPLAY_AUX.lock().unwrap();
         if let Some(ref aux) = *guard {
             let ip = aux.status.ip_address.lock().unwrap().clone();
@@ -799,9 +799,10 @@ fn draw_info_page<D: DrawTarget<Color = Rgb565>>(
             let rssi = *aux.status.rssi.lock().unwrap();
             let dc_in = *aux.status.dc_in_voltage.lock().unwrap();
             let dc_out = *aux.status.dc_out_voltage.lock().unwrap();
-            (ip, ssid, rssi, dc_in, dc_out)
+            let chip_temp = *aux.status.chip_temp.lock().unwrap();
+            (ip, ssid, rssi, dc_in, dc_out, chip_temp)
         } else {
-            ("--".into(), "--".into(), 0i32, 0.0f32, 0.0f32)
+            ("--".into(), "--".into(), 0i32, 0.0f32, 0.0f32, 0.0f32)
         }
     };
 
@@ -851,6 +852,11 @@ fn draw_info_page<D: DrawTarget<Color = Rgb565>>(
     rows.push(vec![
         ("DC In: ".into(), 1), (format!("{:.2}V", dc_in), 3),
         ("  DC Out: ".into(), 1), (format!("{:.2}V", dc_out), 3),
+    ]);
+    rows.push(vec![
+        ("ChipTemp: ".into(), 1),
+        (format!("{:.1}C", chip_temp),
+         if chip_temp < 70.0 { 4 } else if chip_temp < 85.0 { 3 } else { 5 }),
     ]);
 
     // ── Device ───────────────────────────
@@ -1011,25 +1017,26 @@ fn draw_terminal_page<D: DrawTarget<Color = Rgb565>>(
     prev_cells: &mut [[Cell; TERM_COLS]; TERM_ROWS],
     force: bool,
 ) {
-    let should_redraw;
-    {
+    // Snapshot cells while holding the lock as briefly as possible.
+    // The SPI rendering below can take tens of milliseconds; holding the
+    // mutex for that entire time blocks push_data() in the serial RX
+    // thread and causes receive data loss.
+    let (should_redraw, snapshot) = {
         let mut term = rx_buf.inner.lock().unwrap();
-        should_redraw = term.dirty;
-        if should_redraw {
-            term.dirty = false;
-        }
-    }
+        let dirty = term.dirty;
+        if dirty { term.dirty = false; }
+        (dirty || force, term.cells)
+    };
 
-    if !should_redraw && !force {
+    if !should_redraw {
         return;
     }
 
-    let term = rx_buf.inner.lock().unwrap();
     let mut char_buf = [0u8; 4];
 
     for row in 0..TERM_ROWS {
         for col in 0..TERM_COLS {
-            let cell = term.cells[row][col];
+            let cell = snapshot[row][col];
             let prev = prev_cells[row][col];
             if !force
                 && cell.ch == prev.ch

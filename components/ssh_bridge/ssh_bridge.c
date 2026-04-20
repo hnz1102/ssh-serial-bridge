@@ -50,6 +50,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>  /* malloc / free / realloc for wolfSSL_SetAllocators */
 
 /* ── Configuration ───────────────────────────────────────────────────────── */
 
@@ -172,11 +173,17 @@ static void ssh_session_task(void *arg)
     ssh_cdc_tx_cb_t device_write_cb = NULL;
 
     /* Build wolfSSH session */
+    ESP_LOGI(TAG, "heap: total=%u internal=%u psram=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     xSemaphoreTake(s_ssh_mutex, portMAX_DELAY);
 
     WOLFSSH *ssh = wolfSSH_new(s_ctx);
     if (!ssh) {
-        ESP_LOGE(TAG, "wolfSSH_new failed");
+        ESP_LOGE(TAG, "wolfSSH_new failed — internal free=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         xSemaphoreGive(s_ssh_mutex);
         close(client_fd);
         vTaskDelete(NULL);
@@ -187,10 +194,16 @@ static void ssh_session_task(void *arg)
 
     xSemaphoreGive(s_ssh_mutex);
 
+    ESP_LOGI(TAG, "heap after wolfSSH_new: total=%u internal=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
     /* SSH handshake (blocking — wolfSSH_accept does not handle EAGAIN) */
     int rc = wolfSSH_accept(ssh);
     if (rc != WS_SUCCESS) {
-        ESP_LOGW(TAG, "wolfSSH_accept error: rc=%d err=%d", rc, wolfSSH_get_error(ssh));
+        ESP_LOGW(TAG, "wolfSSH_accept error: rc=%d err=%d  internal_free=%u",
+                 rc, wolfSSH_get_error(ssh),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         goto cleanup;
     }
 
@@ -579,8 +592,34 @@ static void ssh_listen_task(void *arg)
             ssh_log_info(tmp);
         }
 
-        /* If a session is already active, reject the new connection */
+        /* If a session is already active, check whether it is still alive.
+         * If the previous session task crashed/was killed without going through
+         * cleanup (e.g. panic, watchdog), s_active_ssh stays non-NULL and all
+         * subsequent connections would be permanently rejected.
+         * Guard the check with s_ssh_mutex to avoid a TOCTOU race. */
+        xSemaphoreTake(s_ssh_mutex, portMAX_DELAY);
         if (s_active_ssh != NULL) {
+            int old_fd = wolfSSH_get_fd(s_active_ssh);
+            /* Probe whether the underlying socket is still open */
+            int probe = fcntl(old_fd, F_GETFL);
+            int dead = (probe < 0 && errno == EBADF);
+            if (!dead) {
+                /* Try a one-byte peek-recv to detect a remotely-closed socket */
+                char peek;
+                int r = recv(old_fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+                dead = (r == 0) || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+            }
+            if (dead) {
+                ESP_LOGW(TAG, "Stale session detected (fd=%d dead) — force-clearing", old_fd);
+                ssh_log_warn("Stale session detected — force-clearing s_active_ssh");
+                wolfSSH_free((WOLFSSH *)s_active_ssh);
+                s_active_ssh = NULL;
+            }
+        }
+        int busy = (s_active_ssh != NULL);
+        xSemaphoreGive(s_ssh_mutex);
+
+        if (busy) {
             ESP_LOGW(TAG, "Already have an active session — rejecting");
             ssh_log_warn("Rejecting: session already active");
             close(client_fd);
@@ -647,6 +686,13 @@ int ssh_bridge_init(uint16_t port,
     }
     ESP_LOGI(TAG, "CDC ring buffer: %d KB (PSRAM)", CDC_RING_SZ / 1024);
 
+    /* Route wolfSSL/wolfCrypt heap allocations through stdlib malloc so that
+     * ESP-IDF's SPIRAM_USE_MALLOC fallback is active.  By default wolfSSL
+     * uses pvPortMalloc() (FreeRTOS internal-SRAM only) when FREERTOS is
+     * defined, which starves the SSH handshake on systems with limited
+     * internal SRAM. */
+    wolfSSL_SetAllocators(malloc, free, realloc);
+
     /* Initialise wolfSSH */
     if (wolfSSH_Init() != WS_SUCCESS) {
         ESP_LOGE(TAG, "wolfSSH_Init() failed");
@@ -663,21 +709,21 @@ int ssh_bridge_init(uint16_t port,
     wolfSSH_SetUserAuth(s_ctx, ws_user_auth);
     wolfSSH_CTX_SetBanner(s_ctx, "ESP32-S3 SSH-Serial-Bridge\r\n");
 
-    /* Load embedded RSA host key (from wolfssh/certs_test.h) */
+    /* Load embedded ECC-256 host key (much less heap than RSA 2048 during handshake) */
     int rc = wolfSSH_CTX_UsePrivateKey_buffer(
         s_ctx,
-        (const byte *)rsa_key_der_2048_ssh,
-        (word32)sizeof_rsa_key_der_2048_ssh,
+        (const byte *)ecc_key_der_256_ssh,
+        (word32)sizeof_ecc_key_der_256_ssh,
         WOLFSSH_FORMAT_ASN1
     );
     if (rc != WS_SUCCESS) {
-        ESP_LOGE(TAG, "UsePrivateKey_buffer() failed: %d", rc);
+        ESP_LOGE(TAG, "UsePrivateKey_buffer(ECC-256) failed: %d", rc);
         wolfSSH_CTX_free(s_ctx);
         s_ctx = NULL;
         return -4;
     }
 
-    ESP_LOGI(TAG, "wolfSSH context ready (RSA 2048 host key loaded)");
+    ESP_LOGI(TAG, "wolfSSH context ready (ECC-256 host key loaded)");
 
     /* Start listener task (stack in PSRAM) */
     BaseType_t ret = xTaskCreateWithCaps(
