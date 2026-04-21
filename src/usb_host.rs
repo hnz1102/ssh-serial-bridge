@@ -1505,19 +1505,19 @@ unsafe fn uart_init(port_num: i32, tx_pin: i32, rx_pin: i32, baud_rate: u32) -> 
         rx_flow_ctrl_thresh: 0,
         ..core::mem::zeroed()
     };
-    let rc = uart_param_config(port_num, &cfg);
+    let rc = uart_param_config(port_num as u32, &cfg);
     if rc != 0 {
         log::warn!("[UART{}] uart_param_config failed: {}", port_num, rc);
         return false;
     }
     // -1 = UART_PIN_NO_CHANGE; no RTS/CTS needed
-    let rc = uart_set_pin(port_num, tx_pin, rx_pin, -1, -1);
+    let rc = uart_set_pin(port_num as u32, tx_pin, rx_pin, -1, -1);
     if rc != 0 {
         log::warn!("[UART{}] uart_set_pin failed: {}", port_num, rc);
         return false;
     }
     // RX buffer 8192 B, no TX buffer (direct write), no event queue
-    let rc = uart_driver_install(port_num, 8192, 0, 0, core::ptr::null_mut(), 0);
+    let rc = uart_driver_install(port_num as u32, 8192, 0, 0, core::ptr::null_mut(), 0);
     if rc != 0 {
         log::warn!("[UART{}] uart_driver_install failed: {}", port_num, rc);
         return false;
@@ -1535,7 +1535,7 @@ fn uart_rx_thread(port_num: i32, device_id: u8) {
     loop {
         let n = unsafe {
             uart_read_bytes(
-                port_num,
+                port_num as u32,
                 buf.as_mut_ptr() as *mut core::ffi::c_void,
                 buf.len() as u32,
                 1,  // ticks; ~10 ms at 100 Hz FreeRTOS tick rate
