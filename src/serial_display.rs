@@ -738,11 +738,11 @@ fn draw_header<D: DrawTarget<Color = Rgb565>>(
 ) {
     let page_num = page + 1;
     let title = match page {
-        PAGE_INFO => format!("System Info   {}/{}", page_num, PAGE_COUNT),
-        PAGE_COM1 => format!("Serial [COM1] {}/{}", page_num, PAGE_COUNT),
-        PAGE_COM2 => format!("Serial [COM2] {}/{}", page_num, PAGE_COUNT),
-        PAGE_USB  => format!("Serial [USB]  {}/{}", page_num, PAGE_COUNT),
-        _         => format!("Unknown       {}/{}", page_num, PAGE_COUNT),
+        PAGE_INFO => format!("SYSTEM INFO   {}/{}", page_num, PAGE_COUNT),
+        PAGE_COM1 => format!("SERIAL [COM1] {}/{}", page_num, PAGE_COUNT),
+        PAGE_COM2 => format!("SERIAL [COM2] {}/{}", page_num, PAGE_COUNT),
+        PAGE_USB  => format!("SERIAL [USB]  {}/{}", page_num, PAGE_COUNT),
+        _         => format!("UNKNOWN       {}/{}", page_num, PAGE_COUNT),
     };
     let _ = Rectangle::new(Point::new(0, 0), Size::new(320, HEADER_H as u32))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))

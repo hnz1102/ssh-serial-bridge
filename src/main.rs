@@ -116,9 +116,14 @@ fn main() {
     };
     let nvs_config = httpserver::load_config(cfg_defaults.clone());
 
+    // Create GPIO/PWM shared state (used by button control, display, and HTTP server)
+    let gpio_pwm_state = gpio_ctrl::GpioPwmState::new();
+
     // ── Button control thread — always started (GPIO0 / BOOT button) ──────────
-    // Short press: cycle display page; Long press (3s): factory reset to cfg.toml defaults
-    btn_ctrl::start_button_thread(peripherals.pins.gpio0);
+    // Short press (< 3s): cycle display page
+    // Medium press (3s ~ 10s): toggle DC OUT (GPIO12) ON/OFF
+    // Very long press (≥ 10s): factory reset to cfg.toml defaults
+    btn_ctrl::start_button_thread(peripherals.pins.gpio0, gpio_pwm_state.clone());
 
     // ── Display init (only when enabled) ──────────────────────────────────
     if nvs_config.display_enable == "true" {
@@ -172,7 +177,6 @@ fn main() {
     }
 
     // Start HTTP config server (login protected, NVS-backed settings)
-    let gpio_pwm_state = gpio_ctrl::GpioPwmState::new();
     let config_state = httpserver::ConfigState::new(nvs_config.clone(), cfg_defaults, dev_status.clone(), gpio_pwm_state.clone());
     let _http_server = match httpserver::start_http_server(config_state) {
         Ok(s)  => { println!("HTTP config server started on port 80"); Some(s) }
