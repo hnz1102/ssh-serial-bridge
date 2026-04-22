@@ -45,6 +45,11 @@ pub struct NvsConfig {
     pub cdc_baud:      String,
     pub display_enable: String,
     pub display_port:  String,
+    pub pwm_enable:    String,
+    pub ntp_server1:   String,
+    pub ntp_server2:   String,
+    pub ntp_server3:   String,
+    pub ntp_server4:   String,
 }
 
 // ─── NVS helpers ─────────────────────────────────────────────────────────────
@@ -111,6 +116,11 @@ fn nvs_write_all(cfg: &NvsConfig) -> bool {
             ("cdc_baud",      &cfg.cdc_baud),
             ("display_enable", &cfg.display_enable),
             ("display_port",  &cfg.display_port),
+            ("pwm_enable",    &cfg.pwm_enable),
+            ("ntp_server1",   &cfg.ntp_server1),
+            ("ntp_server2",   &cfg.ntp_server2),
+            ("ntp_server3",   &cfg.ntp_server3),
+            ("ntp_server4",   &cfg.ntp_server4),
         ];
         let mut ok = true;
         for (key, val) in pairs {
@@ -191,6 +201,11 @@ pub fn load_config(defaults: NvsConfig) -> NvsConfig {
         cdc_baud:      or(nvs_read("cdc_baud"),      &defaults.cdc_baud),
         display_enable: or(nvs_read("display_enable"), &defaults.display_enable),
         display_port:  or(nvs_read("display_port"),  &defaults.display_port),
+        pwm_enable:    or(nvs_read("pwm_enable"),    &defaults.pwm_enable),
+        ntp_server1:   or(nvs_read("ntp_server1"),   &defaults.ntp_server1),
+        ntp_server2:   or(nvs_read("ntp_server2"),   &defaults.ntp_server2),
+        ntp_server3:   or(nvs_read("ntp_server3"),   &defaults.ntp_server3),
+        ntp_server4:   or(nvs_read("ntp_server4"),   &defaults.ntp_server4),
     }
 }
 
@@ -605,6 +620,32 @@ hr{{border:none;border-top:1px solid #1e3a5f;margin:10px 0}}
   </div>
 </div>
 
+<!-- PWM Control -->
+<div class="card">
+  <div class="section-title">&#x1F4CA; PWM Control (GPIO 10, 11)</div>
+  <div style="font-size:.8em;color:#64748b;margin-bottom:6px">Enable PWM Output</div>
+  <div class="toggle-group">
+    <label><input type="radio" name="pwm_enable" value="true" {pwm_true}><span>Enabled</span></label>
+    <label><input type="radio" name="pwm_enable" value="false" {pwm_false}><span>Disabled</span></label>
+  </div>
+  <div style="font-size:.78em;color:#475569;margin-top:6px">Disabled: PWM pins are not initialized (useful when pins are used for other purposes)</div>
+</div>
+
+<!-- NTP Servers -->
+<div class="card">
+  <div class="section-title">&#x1F552; NTP Servers</div>
+  <div class="grid">
+    <div class="field"><label>NTP Server 1 (Primary)</label>
+      <input type="text" name="ntp_server1" value="{ntp_server1}" placeholder="time.google.com"></div>
+    <div class="field"><label>NTP Server 2</label>
+      <input type="text" name="ntp_server2" value="{ntp_server2}" placeholder="time.google.com"></div>
+    <div class="field"><label>NTP Server 3</label>
+      <input type="text" name="ntp_server3" value="{ntp_server3}" placeholder="time.cloudflare.com"></div>
+    <div class="field"><label>NTP Server 4</label>
+      <input type="text" name="ntp_server4" value="{ntp_server4}" placeholder="ntp.nict.jp"></div>
+  </div>
+</div>
+
 
 </form>
 </div>
@@ -760,6 +801,12 @@ document.getElementById('boot-log-overlay').addEventListener('click', function(e
         dp_com1       = if cfg.display_port == "com1" { "selected" } else { "" },
         dp_com2       = if cfg.display_port == "com2" { "selected" } else { "" },
         dp_usb0       = if cfg.display_port == "usb0" { "selected" } else { "" },
+        pwm_true      = chk(&cfg.pwm_enable, "true"),
+        pwm_false     = chk(&cfg.pwm_enable, "false"),
+        ntp_server1   = esc(&cfg.ntp_server1),
+        ntp_server2   = esc(&cfg.ntp_server2),
+        ntp_server3   = esc(&cfg.ntp_server3),
+        ntp_server4   = esc(&cfg.ntp_server4),
     )
 }
 
@@ -1018,6 +1065,11 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
         update!(cdc_enable,    "cdc_enable");
         update!(cdc_baud,      "cdc_baud");
         update!(display_port,  "display_port");
+        update!(pwm_enable,    "pwm_enable");
+        update!(ntp_server1,   "ntp_server1");
+        update!(ntp_server2,   "ntp_server2");
+        update!(ntp_server3,   "ntp_server3");
+        update!(ntp_server4,   "ntp_server4");
 
         // Apply display port change immediately (no reboot needed)
         crate::usb_host::set_display_port(&cfg.display_port);
@@ -1311,7 +1363,10 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
             // Remove from all port sender lists
             crate::usb_host::ws_remove_sender("com1", fd);
             crate::usb_host::ws_remove_sender("com2", fd);
-            crate::usb_host::ws_remove_sender("usb", fd);
+            crate::usb_host::ws_remove_sender("usb0", fd);
+            crate::usb_host::ws_remove_sender("usb1", fd);
+            crate::usb_host::ws_remove_sender("usb2", fd);
+            crate::usb_host::ws_remove_sender("usb3", fd);
             info!("[WS] serial connection closed fd={}", fd);
             return Ok::<(), anyhow::Error>(());
         }
@@ -1337,7 +1392,10 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
                     // Remove from previous port lists first
                     crate::usb_host::ws_remove_sender("com1", fd);
                     crate::usb_host::ws_remove_sender("com2", fd);
-                    crate::usb_host::ws_remove_sender("usb", fd);
+                    crate::usb_host::ws_remove_sender("usb0", fd);
+                    crate::usb_host::ws_remove_sender("usb1", fd);
+                    crate::usb_host::ws_remove_sender("usb2", fd);
+                    crate::usb_host::ws_remove_sender("usb3", fd);
                     // Register for new port
                     crate::usb_host::ws_register_sender(&port, fd, sender);
                 }
@@ -1372,7 +1430,8 @@ fn parse_ws_port(msg: &str) -> Option<String> {
             if let Some(end) = rest.find('"') {
                 let port = &rest[..end];
                 match port {
-                    "com1" | "com2" | "usb" | "usb0" => return Some(port.to_string()),
+                    "com1" | "com2" | "usb0" | "usb1" | "usb2" | "usb3" => return Some(port.to_string()),
+                    "usb" => return Some("usb0".to_string()),
                     _ => {}
                 }
             }
@@ -1419,7 +1478,10 @@ body{background:#111827;color:#e2e8f0;font-family:'Segoe UI',Arial,sans-serif;he
   <select id="port-select">
     <option value="com1">COM1</option>
     <option value="com2">COM2</option>
-    <option value="usb">USB</option>
+    <option value="usb0" id="opt-usb0" style="display:none">USB0</option>
+    <option value="usb1" id="opt-usb1" style="display:none">USB1</option>
+    <option value="usb2" id="opt-usb2" style="display:none">USB2</option>
+    <option value="usb3" id="opt-usb3" style="display:none">USB3</option>
   </select>
   <button id="btn-conn" class="toolbar btn-connect" onclick="toggleConnection()">Connect</button>
   <span id="ws-status" class="status off">Disconnected</span>
@@ -1505,6 +1567,22 @@ term.onData((data) => {
     ws.send(encoder.encode(data));
   }
 });
+
+// Populate USB port options based on connected device
+function updateUsbOptions() {
+  fetch('/api/status')
+  .then(r => r.json())
+  .then(d => {
+    var count = (d.cdc_enabled && d.usb_connected) ? (d.usb_ports || 1) : 0;
+    for (var i = 0; i < 4; i++) {
+      var opt = document.getElementById('opt-usb' + i);
+      if (opt) opt.style.display = i < count ? '' : 'none';
+    }
+  })
+  .catch(function(){});
+}
+updateUsbOptions();
+setInterval(updateUsbOptions, 5000);
 </script>
 </body></html>"#.to_string()
 }

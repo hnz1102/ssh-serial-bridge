@@ -70,6 +70,16 @@ pub struct Config {
     display_enable: &'static str,
     #[default("com1")]
     display_port: &'static str,
+    #[default("true")]
+    pwm_enable: &'static str,
+    #[default("time.aws.com")]
+    ntp_server1: &'static str,
+    #[default("time.google.com")]
+    ntp_server2: &'static str,
+    #[default("time.cloudflare.com")]
+    ntp_server3: &'static str,
+    #[default("ntp.nict.jp")]
+    ntp_server4: &'static str,
 }
 
 fn main() {
@@ -113,6 +123,11 @@ fn main() {
         cdc_baud:      CONFIG.cdc_baud.to_string(),
         display_enable: CONFIG.display_enable.to_string(),
         display_port:  CONFIG.display_port.to_string(),
+        pwm_enable:    CONFIG.pwm_enable.to_string(),
+        ntp_server1:   CONFIG.ntp_server1.to_string(),
+        ntp_server2:   CONFIG.ntp_server2.to_string(),
+        ntp_server3:   CONFIG.ntp_server3.to_string(),
+        ntp_server4:   CONFIG.ntp_server4.to_string(),
     };
     let nvs_config = httpserver::load_config(cfg_defaults.clone());
 
@@ -229,11 +244,12 @@ fn main() {
     }
 
     // NTP Server
+    let ntp1: &'static str = Box::leak(nvs_config.ntp_server1.clone().into_boxed_str());
+    let ntp2: &'static str = Box::leak(nvs_config.ntp_server2.clone().into_boxed_str());
+    let ntp3: &'static str = Box::leak(nvs_config.ntp_server3.clone().into_boxed_str());
+    let ntp4: &'static str = Box::leak(nvs_config.ntp_server4.clone().into_boxed_str());
     let sntp_conf = SntpConf {
-        servers: ["time.aws.com",
-                    "time.google.com",
-                    "time.cloudflare.com",
-                    "ntp.nict.jp"],
+        servers: [ntp1, ntp2, ntp3, ntp4],
         operating_mode: OperatingMode::Poll,
         sync_mode: SyncMode::Immediate,
     };
@@ -275,22 +291,7 @@ fn main() {
         gpio_pwm_state.clone(),
     );
 
-    println!("Starting PWM init...");
-    let timer_config_out_current_0 = TimerConfig::default().frequency(1.kHz().into())
-        .resolution(esp_idf_hal::ledc::config::Resolution::Bits14);
-    let timer_driver_0 = LedcTimerDriver::new(peripherals.ledc.timer0, &timer_config_out_current_0).unwrap();
-    let mut pwm_driver_0 = LedcDriver::new(peripherals.ledc.channel0, &timer_driver_0, peripherals.pins.gpio1).unwrap();
-    pwm_driver_0.set_duty(0).expect("Set duty failure");
-    let max_duty_0 = pwm_driver_0.get_max_duty();
-    info!("Max duty: {}", max_duty_0);
-
-    let timer_config_out_current_1 = TimerConfig::default().frequency(1.kHz().into())
-        .resolution(esp_idf_hal::ledc::config::Resolution::Bits14);
-    let timer_driver_1 = LedcTimerDriver::new(peripherals.ledc.timer1, &timer_config_out_current_1).unwrap();
-    let mut pwm_driver_1 = LedcDriver::new(peripherals.ledc.channel1, &timer_driver_1, peripherals.pins.gpio2).unwrap();
-    pwm_driver_1.set_duty(0).expect("Set duty failure");
-    let max_duty_1 = pwm_driver_1.get_max_duty();
-    info!("Max duty: {}", max_duty_1);
+    let pwm_enabled = nvs_config.pwm_enable == "true";
 
     // ── GPIO 4-9, 12 output init ─────────────────────────────────────────────
     println!("Initializing GPIO 4-9,12 outputs...");
@@ -308,22 +309,32 @@ fn main() {
     }
 
     // ── PWM GPIO 10-11 (LEDC timer2/3, channel2/3) ────────────────────────
-    println!("Initializing PWM GPIO 10-11...");
-    let timer_cfg_10 = TimerConfig::default().frequency(1.kHz().into())
-        .resolution(esp_idf_hal::ledc::config::Resolution::Bits14);
-    let timer_driver_2 = LedcTimerDriver::new(peripherals.ledc.timer2, &timer_cfg_10).unwrap();
-    let mut pwm_gpio10 = LedcDriver::new(peripherals.ledc.channel2, &timer_driver_2, peripherals.pins.gpio10).unwrap();
-    pwm_gpio10.set_duty(0).expect("Set duty failure gpio10");
-    let max_duty_gpio10 = pwm_gpio10.get_max_duty();
-
-    let timer_cfg_11 = TimerConfig::default().frequency(1.kHz().into())
-        .resolution(esp_idf_hal::ledc::config::Resolution::Bits14);
-    let timer_driver_3 = LedcTimerDriver::new(peripherals.ledc.timer3, &timer_cfg_11).unwrap();
-    let mut pwm_gpio11 = LedcDriver::new(peripherals.ledc.channel3, &timer_driver_3, peripherals.pins.gpio11).unwrap();
-    pwm_gpio11.set_duty(0).expect("Set duty failure gpio11");
-    let max_duty_gpio11 = pwm_gpio11.get_max_duty();
-
-    info!("PWM gpio10 max_duty: {}, gpio11 max_duty: {}", max_duty_gpio10, max_duty_gpio11);
+    // Box::leak makes the timer drivers 'static so LedcDriver<'static> can live
+    // through the main loop inside an Option.
+    let (mut pwm_gpio10_opt, max_duty_gpio10, mut pwm_gpio11_opt, max_duty_gpio11) = if pwm_enabled {
+        println!("Initializing PWM GPIO 10-11...");
+        let tc10 = TimerConfig::default().frequency(1.kHz().into())
+            .resolution(esp_idf_hal::ledc::config::Resolution::Bits14);
+        let td2: &'static _ = Box::leak(Box::new(
+            LedcTimerDriver::new(peripherals.ledc.timer2, &tc10).unwrap()
+        ));
+        let mut p10 = LedcDriver::new(peripherals.ledc.channel2, td2, peripherals.pins.gpio10).unwrap();
+        p10.set_duty(0).expect("Set duty failure gpio10");
+        let max10 = p10.get_max_duty();
+        let tc11 = TimerConfig::default().frequency(1.kHz().into())
+            .resolution(esp_idf_hal::ledc::config::Resolution::Bits14);
+        let td3: &'static _ = Box::leak(Box::new(
+            LedcTimerDriver::new(peripherals.ledc.timer3, &tc11).unwrap()
+        ));
+        let mut p11 = LedcDriver::new(peripherals.ledc.channel3, td3, peripherals.pins.gpio11).unwrap();
+        p11.set_duty(0).expect("Set duty failure gpio11");
+        let max11 = p11.get_max_duty();
+        info!("PWM gpio10 max_duty: {}, gpio11 max_duty: {}", max10, max11);
+        (Some(p10), max10, Some(p11), max11)
+    } else {
+        info!("PWM disabled (gpio10, gpio11 not initialized)");
+        (None, 0, None, 0)
+    };
 
     // ── ADC2 init ─────────────────────────────────────────────
     let adc2 = AdcDriver::new(peripherals.adc2).unwrap();
@@ -353,13 +364,13 @@ fn main() {
             }
         }
 
-        // ── Apply PWM GPIO 10-11 desired duty ─────────────────────────────
-        {
+        // ── Apply PWM GPIO 10-11 desired duty (only when PWM is enabled) ──
+        if let (Some(ref mut p10), Some(ref mut p11)) = (&mut pwm_gpio10_opt, &mut pwm_gpio11_opt) {
             let duties = gpio_pwm_state.get_pwm();
             let raw10 = (duties[0] as u32 * max_duty_gpio10) / 100;
             let raw11 = (duties[1] as u32 * max_duty_gpio11) / 100;
-            pwm_gpio10.set_duty(raw10).ok();
-            pwm_gpio11.set_duty(raw11).ok();
+            p10.set_duty(raw10).ok();
+            p11.set_duty(raw11).ok();
         }
 
         if count % 50 == 0 {

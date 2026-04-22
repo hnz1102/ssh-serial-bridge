@@ -13,10 +13,10 @@ syslog_host_name = "esp32s3"
 syslog_app_name  = "ssh-bridge"
 
 ssh_user     = "admin"
-ssh_password = "esp32"
+ssh_password = "sshpass"
 
-com1_tx_pin = "43"    # XIAO-ESP32S3
-com1_rx_pin = "44"
+com1_tx_pin = "17" # for XIAO-ESP32S3 43
+com1_rx_pin = "18" # for XIAO-ESP32S3 44
 com1_baud   = "115200"
 com2_tx_pin = "41"
 com2_rx_pin = "42"
@@ -27,3 +27,10 @@ cdc_baud   = "115200"
 
 display_enable = "false"
 display_port   = "com1"    # "com1" / "com2" / "usb"
+
+pwm_enable = "true"
+
+ntp_server1 = "time.aws.com"
+ntp_server2 = "time.google.com"
+ntp_server3 = "time.cloudflare.com"
+ntp_server4 = "ntp.nict.jp"

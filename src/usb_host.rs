@@ -82,6 +82,9 @@ use std::collections::{HashMap, VecDeque};
 pub static WS_SENDERS_COM1: std::sync::Mutex<Vec<(i32, EspHttpWsDetachedSender)>> = std::sync::Mutex::new(Vec::new());
 pub static WS_SENDERS_COM2: std::sync::Mutex<Vec<(i32, EspHttpWsDetachedSender)>> = std::sync::Mutex::new(Vec::new());
 pub static WS_SENDERS_USB:  std::sync::Mutex<Vec<(i32, EspHttpWsDetachedSender)>> = std::sync::Mutex::new(Vec::new());
+pub static WS_SENDERS_USB1: std::sync::Mutex<Vec<(i32, EspHttpWsDetachedSender)>> = std::sync::Mutex::new(Vec::new());
+pub static WS_SENDERS_USB2: std::sync::Mutex<Vec<(i32, EspHttpWsDetachedSender)>> = std::sync::Mutex::new(Vec::new());
+pub static WS_SENDERS_USB3: std::sync::Mutex<Vec<(i32, EspHttpWsDetachedSender)>> = std::sync::Mutex::new(Vec::new());
 
 /// Separate fd→device_id map for lock-free port lookup from the httpd handler
 /// thread. Using WS_SENDERS_* for this lookup causes a deadlock: the ws_send
@@ -95,11 +98,17 @@ const WS_RING_CAP: usize = 65536;
 static WS_RING_COM1: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_RING_COM2: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_RING_USB:  std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
+static WS_RING_USB1: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
+static WS_RING_USB2: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
+static WS_RING_USB3: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 
 fn ws_senders_for(device_id: u8) -> &'static std::sync::Mutex<Vec<(i32, EspHttpWsDetachedSender)>> {
     match device_id {
         DEVICE_COM1 => &WS_SENDERS_COM1,
         DEVICE_COM2 => &WS_SENDERS_COM2,
+        DEVICE_USB1 => &WS_SENDERS_USB1,
+        DEVICE_USB2 => &WS_SENDERS_USB2,
+        DEVICE_USB3 => &WS_SENDERS_USB3,
         _ => &WS_SENDERS_USB,
     }
 }
@@ -108,6 +117,9 @@ fn ws_ring_for(device_id: u8) -> &'static std::sync::Mutex<VecDeque<u8>> {
     match device_id {
         DEVICE_COM1 => &WS_RING_COM1,
         DEVICE_COM2 => &WS_RING_COM2,
+        DEVICE_USB1 => &WS_RING_USB1,
+        DEVICE_USB2 => &WS_RING_USB2,
+        DEVICE_USB3 => &WS_RING_USB3,
         _ => &WS_RING_USB,
     }
 }
@@ -117,6 +129,9 @@ pub fn ws_register_sender(port_name: &str, fd: i32, sender: EspHttpWsDetachedSen
     let device_id = match port_name {
         "com1" => DEVICE_COM1,
         "com2" => DEVICE_COM2,
+        "usb1" => DEVICE_USB1,
+        "usb2" => DEVICE_USB2,
+        "usb3" => DEVICE_USB3,
         _ => DEVICE_USB0,
     };
     let senders = ws_senders_for(device_id);
@@ -133,6 +148,9 @@ pub fn ws_remove_sender(port_name: &str, fd: i32) {
     let device_id = match port_name {
         "com1" => DEVICE_COM1,
         "com2" => DEVICE_COM2,
+        "usb1" => DEVICE_USB1,
+        "usb2" => DEVICE_USB2,
+        "usb3" => DEVICE_USB3,
         _ => DEVICE_USB0,
     };
     let senders = ws_senders_for(device_id);
@@ -152,7 +170,10 @@ pub fn ws_port_for_fd(fd: i32) -> &'static str {
         return match map.get(&fd).copied() {
             Some(d) if d == DEVICE_COM1 => "com1",
             Some(d) if d == DEVICE_COM2 => "com2",
-            Some(d) if d != DEVICE_NONE => "usb",
+            Some(d) if d == DEVICE_USB1 => "usb1",
+            Some(d) if d == DEVICE_USB2 => "usb2",
+            Some(d) if d == DEVICE_USB3 => "usb3",
+            Some(d) if d == DEVICE_USB0 => "usb0",
             _ => "",
         };
     }
@@ -216,9 +237,15 @@ pub fn start_ws_sender_thread() {
                 ws_drain_and_send(DEVICE_COM1);
                 ws_drain_and_send(DEVICE_COM2);
                 ws_drain_and_send(DEVICE_USB0);
+                ws_drain_and_send(DEVICE_USB1);
+                ws_drain_and_send(DEVICE_USB2);
+                ws_drain_and_send(DEVICE_USB3);
                 ws_drain_tx(DEVICE_COM1);
                 ws_drain_tx(DEVICE_COM2);
                 ws_drain_tx(DEVICE_USB0);
+                ws_drain_tx(DEVICE_USB1);
+                ws_drain_tx(DEVICE_USB2);
+                ws_drain_tx(DEVICE_USB3);
                 thread::sleep(Duration::from_millis(5));
             }
         })
@@ -230,6 +257,9 @@ pub fn start_ws_sender_thread() {
 static WS_TX_COM1: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_TX_COM2: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_TX_USB:  std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
+static WS_TX_USB1: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
+static WS_TX_USB2: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
+static WS_TX_USB3: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 
 /// Write data to a serial port (for WebSocket TX direction: browser → serial).
 /// Non-blocking: enqueues data for the ws_sender_thread to drain.
@@ -237,6 +267,9 @@ pub fn serial_write(port_name: &str, data: &[u8]) {
     let queue = match port_name {
         "com1" => &WS_TX_COM1,
         "com2" => &WS_TX_COM2,
+        "usb1" => &WS_TX_USB1,
+        "usb2" => &WS_TX_USB2,
+        "usb3" => &WS_TX_USB3,
         "usb" | "usb0" => &WS_TX_USB,
         _ => return,
     };
@@ -255,6 +288,9 @@ fn ws_drain_tx(device_id: u8) {
     let queue = match device_id {
         DEVICE_COM1 => &WS_TX_COM1,
         DEVICE_COM2 => &WS_TX_COM2,
+        DEVICE_USB1 => &WS_TX_USB1,
+        DEVICE_USB2 => &WS_TX_USB2,
+        DEVICE_USB3 => &WS_TX_USB3,
         _ => &WS_TX_USB,
     };
     let data: Vec<u8> = {
@@ -276,6 +312,12 @@ fn ws_drain_tx(device_id: u8) {
         DEVICE_COM2 => {
             if UART2_READY.load(Ordering::Relaxed) {
                 unsafe { uart_write_bytes(2, data.as_ptr() as *const c_void, data.len()); }
+            }
+        }
+        d if d == DEVICE_USB1 || d == DEVICE_USB2 || d == DEVICE_USB3 => {
+            let port = (device_id - DEVICE_USB1 + 1) as usize;
+            if CDC_ENABLED.load(Ordering::Relaxed) && CDC_DEV_HDL.load(Ordering::Acquire) != 0 {
+                unsafe { usb_cdc_write_port(port, data.as_ptr(), data.len()); }
             }
         }
         _ => {
