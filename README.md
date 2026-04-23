@@ -434,6 +434,41 @@ Usage:
 
 ---
 
+## Supported USB CDC Devices
+
+The USB Host driver auto-detects the connected adapter by VID/PID and applies
+the appropriate initialisation sequence.  The baud rate is set by `cdc_baud`
+in `cfg.toml` (default: `115200`).
+
+> **Note:** `cdc_enable` must be set to `"true"` in `cfg.toml` (or via Web UI)
+> to activate the USB Host driver.  When disabled, `usb0`–`usb3` are
+> unavailable as SSH console targets.
+
+### Vendor-class adapters
+
+| Chip | VID | PID(s) | Ports | Notes |
+|------|-----|--------|-------|-------|
+| **PL2303** | `067B` | `2303`, `23A3`, `2304` | 1 | Prolific Technology |
+| **CP210x** | `10C4` | `EA60`, `EA61`, `EA70` | 1 | Silicon Labs |
+| **FT232R** | `0403` | `6001` | 1 | FTDI |
+| **FT232H** | `0403` | `6014` | 1 | FTDI |
+| **FT2232H/D** | `0403` | `6010` | 2 | FTDI — maps to `usb0` / `usb1` |
+| **FT4232H** | `0403` | `6011` | 4 | FTDI — maps to `usb0`–`usb3` |
+
+### Port mapping
+
+Multi-port FTDI adapters expose multiple ports, mapped to SSH console targets
+in channel order:
+
+| SSH target | Description |
+|------------|-------------|
+| `usb0` | Port 1 — all single-port adapters; FT2232 ch.A; FT4232 ch.A |
+| `usb1` | Port 2 — FT2232 ch.B; FT4232 ch.B |
+| `usb2` | Port 3 — FT4232 ch.C |
+| `usb3` | Port 4 — FT4232 ch.D |
+
+---
+
 ## Dependencies
 
 | Component / Library | Version | License | Purpose |
