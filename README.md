@@ -103,7 +103,9 @@ ssh-serial-bridge/
 | GPIO     | Function |
 |----------|----------|
 | 0 (BOOT) | Short press (<3 s): Cycle display page / Medium press (3–10 s): Toggle DC OUT (GPIO12) / Long press (≥10 s): NVS factory reset |
-
+**Factory Reset Display Indicators:**
+- **6–10 seconds** (button held): Display shows "FACTORY RESET" with countdown "Resetting to defaults in X seconds..."
+- **10 seconds** (trigger): Display shows "FACTORY RESET" / "Erasing NVS... Please wait..." and device reboots
 ---
 
 ## Configuration
@@ -202,6 +204,10 @@ If the device is already running with Wi-Fi configured but you want to switch to
 ### WPS Status Indicators
 
 When WPS is active:
+- **Display (if enabled)**: Shows "WPS MODE" with countdown timer (120 seconds)
+  - "Press WPS button on your router within 120 seconds"
+  - Countdown updates every 10 seconds
+  - On success: "WPS SUCCESS" → "Connecting to {SSID}" → "CONNECTED"
 - **Syslog (if enabled)**: Logs WPS start, success, or failure events
 - **Web UI**: Shows WPS status during the connection process
 
