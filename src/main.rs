@@ -349,6 +349,17 @@ fn main() {
     // ADC2 Channel 3 (GPIO14) init ─────────────────────────────────────────────
     let mut adc14_pin = AdcChannelDriver::new(&adc2, peripherals.pins.gpio14, &adc_config).unwrap();
 
+    // ── GPIO1 input: power source detection (HIGH=DC jack, LOW=USB) ───────
+    let mut gpio1_power = PinDriver::input(peripherals.pins.gpio1).unwrap();
+    gpio1_power.set_pull(Pull::Up).unwrap();
+    let power_from_dc = gpio1_power.is_high();
+    if power_from_dc {
+        info!("Power source: DC jack input");
+    } else {
+        info!("Power source: USB (no DC jack input)");
+    }
+    let mut last_power_from_dc = power_from_dc;
+
     // ── Internal temperature sensor init ──────────────────────────────────
     let temp_cfg = TempSensorConfig::default();
     let mut temp_sensor = TempSensorDriver::new(&temp_cfg, peripherals.temp_sensor).unwrap();
@@ -371,6 +382,17 @@ fn main() {
             let raw11 = (duties[1] as u32 * max_duty_gpio11) / 100;
             p10.set_duty(raw10).ok();
             p11.set_duty(raw11).ok();
+        }
+
+        // ── Power source change detection (GPIO1) ────────────────────────────
+        let power_from_dc = gpio1_power.is_high();
+        if power_from_dc != last_power_from_dc {
+            last_power_from_dc = power_from_dc;
+            if power_from_dc {
+                info!("Power source changed: DC jack input");
+            } else {
+                info!("Power source changed: USB (no DC jack input)");
+            }
         }
 
         if count % 50 == 0 {
