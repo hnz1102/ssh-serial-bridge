@@ -12,6 +12,7 @@ C component (wolfSSH) for the SSH server.
 | Serial ports | COM1 / COM2 (UART) and USB CDC (USB Host) — up to 4 ports (`usb0`–`usb3`) |
 | Web UI | Browser-based configuration, terminal, and GPIO control |
 | WebSocket terminal | Built-in xterm.js; access serial data from the browser at `/terminal` |
+| WPS support | Wi-Fi Protected Setup (PBC mode) — configure Wi-Fi via button or Web UI |
 | GPIO / PWM | Digital output (ON/OFF) on GPIO 4–9, 12 ; PWM output on GPIO 10–11 |
 | SPI display | Optional ST7789V (320×240) display showing incoming serial data |
 | UDP Syslog | RFC 5424 remote logging over UDP |
@@ -101,7 +102,7 @@ ssh-serial-bridge/
 
 | GPIO     | Function |
 |----------|----------|
-| 0 (BOOT) | Short press: cycle display page / Long press (3 s): NVS factory reset |
+| 0 (BOOT) | Short press (<3 s): Cycle display page / Medium press (3–10 s): Toggle DC OUT (GPIO12) / Long press (≥10 s): NVS factory reset |
 
 ---
 
@@ -153,6 +154,66 @@ ntp_server4 = "ntp.nict.jp"
 
 Values in `cfg.toml` are compiled into the firmware as defaults.  
 After boot they can be overridden via the Web UI or direct NVS writes; NVS values take priority.
+
+---
+
+## Wi-Fi Setup with WPS
+
+**WPS (Wi-Fi Protected Setup)** allows you to connect to a Wi-Fi network without manually entering the SSID and password. This device supports **WPS Push Button Configuration (PBC)** mode.
+
+### Method 1: Using cfg.toml and Factory Reset (Recommended for initial setup)
+
+If you don't have Wi-Fi credentials yet or want to reconfigure via WPS without Web UI access:
+
+1. **Edit `cfg.toml` before building** (or rebuild the firmware):
+   ```toml
+   wifi_ssid      = ""           # Set to empty string
+   wps_enable     = "true"       # Enable WPS mode on boot
+   ```
+
+2. **Flash the firmware** to the device
+
+3. On boot, the device will automatically enter WPS mode and wait for you to **press the WPS button on your Wi-Fi router** (timeout: 2 minutes)
+
+4. Upon successful WPS connection, the credentials are saved to NVS and the device reboots
+
+**Alternative: Trigger WPS via Factory Reset**
+
+If the device is already running with Wi-Fi configured but you want to switch to WPS:
+
+1. **Edit `cfg.toml`** to set `wps_enable = "true"` and `wifi_ssid = ""`
+2. **Rebuild and flash** the firmware
+3. **Perform a Factory Reset**: Press and hold the BOOT button (GPIO 0) for **≥10 seconds**
+4. The device will erase NVS, restore `cfg.toml` defaults, and reboot into WPS mode
+5. **Press the WPS button on your Wi-Fi router** within 2 minutes
+
+> **Note**: Web UI is not accessible until Wi-Fi is connected, so this method is essential for initial setup or when you lose Wi-Fi access.
+
+---
+
+### Method 2: Using the Web UI (when already connected to Wi-Fi)
+
+1. Navigate to the configuration page at `http://<device_ip>/`
+2. Find the **WPS** section
+3. Click the **"Start WPS"** button
+4. **Press the WPS button on your Wi-Fi router** within 2 minutes
+5. The device will automatically receive and save the Wi-Fi credentials and reboot
+
+### WPS Status Indicators
+
+When WPS is active:
+- **Syslog (if enabled)**: Logs WPS start, success, or failure events
+- **Web UI**: Shows WPS status during the connection process
+
+### WPS Fallback
+
+If WPS fails or times out, the device will revert to the previously configured Wi-Fi credentials (from `cfg.toml` or NVS).
+
+### Notes
+
+- WPS PBC mode is the only supported WPS method (PIN mode is not supported)
+- After successful WPS configuration, the new credentials are saved to NVS and persist across reboots
+- You can still manually configure Wi-Fi credentials via `cfg.toml` or the Web UI if WPS is not available on your router
 
 ---
 

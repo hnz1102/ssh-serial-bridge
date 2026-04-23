@@ -34,6 +34,7 @@ fn button_task(btn_pin: Gpio0, gpio_pwm_state: GpioPwmState) {
     let mut press_start: Option<Instant> = None;
     let mut dcout_triggered = false;
     let mut factory_reset_triggered = false;
+    let mut display_updated = false;
 
     loop {
         let btn_now = btn.is_high(); // high = released
@@ -43,14 +44,43 @@ fn button_task(btn_pin: Gpio0, gpio_pwm_state: GpioPwmState) {
             press_start = Some(Instant::now());
             dcout_triggered = false;
             factory_reset_triggered = false;
+            display_updated = false;
         } else if !btn_now {
             // ── Button held ─────────────────────────────────────────────
             if let Some(start) = press_start {
                 let elapsed = start.elapsed().as_millis() as u64;
                 
+                // Show countdown after 6 seconds
+                if elapsed >= 6000 && !display_updated {
+                    let remaining = ((FACTORY_RESET_PRESS_MS - elapsed) / 1000) as i32;
+                    if remaining > 0 {
+                        crate::serial_display::show_system_message(
+                            "FACTORY RESET",
+                            &format!("Resetting to defaults\nin {} seconds...", remaining)
+                        );
+                        display_updated = true;
+                    }
+                }
+                
+                // Update countdown display every second
+                if elapsed >= 6000 && (elapsed / 1000) != ((elapsed - 50) / 1000) {
+                    let remaining = ((FACTORY_RESET_PRESS_MS - elapsed) / 1000) as i32;
+                    if remaining > 0 {
+                        crate::serial_display::show_system_message(
+                            "FACTORY RESET",
+                            &format!("Resetting to defaults\nin {} seconds...", remaining)
+                        );
+                    }
+                }
+                
                 // Check for factory reset (≥10s)
                 if !factory_reset_triggered && elapsed >= FACTORY_RESET_PRESS_MS {
                     info!("GPIO0 very long press ({}ms) — factory reset to cfg.toml defaults", elapsed);
+                    crate::serial_display::show_system_message(
+                        "FACTORY RESET",
+                        "Erasing NVS...\nPlease wait..."
+                    );
+                    thread::sleep(Duration::from_millis(500)); // Give display time to update
                     crate::httpserver::factory_reset(); // never returns (no need to set flag)
                 }
                 // Check for DC OUT toggle (≥3s but <10s)
@@ -72,9 +102,14 @@ fn button_task(btn_pin: Gpio0, gpio_pwm_state: GpioPwmState) {
                     crate::serial_display::next_page();
                 }
             }
+            // Clear system message when button is released
+            if display_updated {
+                crate::serial_display::clear_system_message();
+            }
             press_start = None;
             dcout_triggered = false;
             factory_reset_triggered = false;
+            display_updated = false;
         }
 
         btn_last = btn_now;

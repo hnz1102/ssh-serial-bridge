@@ -1,6 +1,7 @@
 [ssh-serial-bridge]
-wifi_ssid      = "your-ssid"
-wifi_psk       = "your-password"
+wps_enable     = "true"     # "true": use WPS PBC on next boot when SSID is empty
+wifi_ssid      = ""         # your-ssid
+wifi_psk       = ""         # your-password
 ip_mode        = "dhcp"           # "dhcp" or "static"
 ip_address     = "192.168.2.200"
 subnet_mask    = "255.255.255.0"

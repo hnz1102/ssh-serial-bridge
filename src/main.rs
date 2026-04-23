@@ -50,6 +50,8 @@ pub struct Config {
     ssh_user: &'static str,
     #[default("esp32")]
     ssh_password: &'static str,
+    #[default("false")]
+    wps_enable: &'static str,
     #[default("17")]
     com1_tx_pin: &'static str,
     #[default("18")]
@@ -113,6 +115,7 @@ fn main() {
         syslog_app_name: CONFIG.syslog_app_name.to_string(),
         ssh_user:      CONFIG.ssh_user.to_string(),
         ssh_password:  CONFIG.ssh_password.to_string(),
+        wps_enable:    CONFIG.wps_enable.to_string(),
         com1_tx_pin:   CONFIG.com1_tx_pin.to_string(),
         com1_rx_pin:   CONFIG.com1_rx_pin.to_string(),
         com1_baud:     CONFIG.com1_baud.to_string(),
@@ -129,7 +132,7 @@ fn main() {
         ntp_server3:   CONFIG.ntp_server3.to_string(),
         ntp_server4:   CONFIG.ntp_server4.to_string(),
     };
-    let nvs_config = httpserver::load_config(cfg_defaults.clone());
+    let mut nvs_config = httpserver::load_config(cfg_defaults.clone());
 
     // Create GPIO/PWM shared state (used by button control, display, and HTTP server)
     let gpio_pwm_state = gpio_ctrl::GpioPwmState::new();
@@ -164,8 +167,26 @@ fn main() {
     }
 
     // WiFi connect (using NVS config — falls back to cfg.toml if not set)
-    println!("Connecting to WiFi: {}", nvs_config.wifi_ssid);
-    let mut wifi_dev = wifi::wifi_connect(peripherals.modem, &nvs_config.wifi_ssid, &nvs_config.wifi_psk);
+    // When wps_enable=true and SSID is empty, WPS PBC is used to obtain credentials.
+    let mut wifi_dev = if nvs_config.wps_enable == "true" && nvs_config.wifi_ssid.is_empty() {
+        println!("WPS enabled and SSID not configured — starting WPS PBC (press WPS button on router)...");
+        match wifi::wifi_connect_wps(peripherals.modem) {
+            Ok((w, ssid, pass)) => {
+                println!("WPS success: SSID={}", ssid);
+                httpserver::nvs_write_wifi_creds(&ssid, &pass);
+                nvs_config.wifi_ssid = ssid;
+                nvs_config.wifi_psk  = pass;
+                Ok(w)
+            }
+            Err(e) => {
+                println!("WPS failed: {:?}", e);
+                Err(e)
+            }
+        }
+    } else {
+        println!("Connecting to WiFi: {}", nvs_config.wifi_ssid);
+        wifi::wifi_connect(peripherals.modem, &nvs_config.wifi_ssid, &nvs_config.wifi_psk)
+    };
 
     // Create shared status and populate IP/SSID after WiFi connects
     let dev_status = httpserver::StatusInfo::new();

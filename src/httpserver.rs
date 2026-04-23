@@ -45,6 +45,7 @@ pub struct NvsConfig {
     pub cdc_baud:      String,
     pub display_enable: String,
     pub display_port:  String,
+    pub wps_enable:    String,
     pub pwm_enable:    String,
     pub ntp_server1:   String,
     pub ntp_server2:   String,
@@ -116,6 +117,7 @@ fn nvs_write_all(cfg: &NvsConfig) -> bool {
             ("cdc_baud",      &cfg.cdc_baud),
             ("display_enable", &cfg.display_enable),
             ("display_port",  &cfg.display_port),
+            ("wps_enable",    &cfg.wps_enable),
             ("pwm_enable",    &cfg.pwm_enable),
             ("ntp_server1",   &cfg.ntp_server1),
             ("ntp_server2",   &cfg.ntp_server2),
@@ -154,6 +156,35 @@ fn nvs_erase_namespace() -> bool {
             return false;
         }
         let ok = nvs_erase_all(handle) == ESP_OK;
+        nvs_commit(handle);
+        nvs_close(handle);
+        ok
+    }
+}
+
+/// Write only wifi_ssid and wifi_psk to NVS (called after a successful WPS handshake).
+pub fn nvs_write_wifi_creds(ssid: &str, psk: &str) -> bool {
+    let ns = match CString::new(NVS_NS) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    unsafe {
+        let mut handle: nvs_handle_t = 0;
+        if nvs_open(ns.as_ptr(), nvs_open_mode_t_NVS_READWRITE, &mut handle) != ESP_OK {
+            return false;
+        }
+        let mut ok = true;
+        for (key, val) in [("wifi_ssid", ssid), ("wifi_psk", psk)] {
+            match (CString::new(key), CString::new(val)) {
+                (Ok(k), Ok(v)) => {
+                    if nvs_set_str(handle, k.as_ptr(), v.as_ptr()) != ESP_OK {
+                        warn!("NVS: failed to write key '{}'", key);
+                        ok = false;
+                    }
+                }
+                _ => { ok = false; }
+            }
+        }
         nvs_commit(handle);
         nvs_close(handle);
         ok
@@ -201,6 +232,7 @@ pub fn load_config(defaults: NvsConfig) -> NvsConfig {
         cdc_baud:      or(nvs_read("cdc_baud"),      &defaults.cdc_baud),
         display_enable: or(nvs_read("display_enable"), &defaults.display_enable),
         display_port:  or(nvs_read("display_port"),  &defaults.display_port),
+        wps_enable:    or(nvs_read("wps_enable"),    &defaults.wps_enable),
         pwm_enable:    or(nvs_read("pwm_enable"),    &defaults.pwm_enable),
         ntp_server1:   or(nvs_read("ntp_server1"),   &defaults.ntp_server1),
         ntp_server2:   or(nvs_read("ntp_server2"),   &defaults.ntp_server2),
@@ -515,6 +547,13 @@ hr{{border:none;border-top:1px solid #1e3a5f;margin:10px 0}}
     <div class="field"><label>Password</label>
       <input type="password" name="wifi_psk" value="{wifi_psk}" maxlength="64" autocomplete="off"></div>
   </div>
+  <hr>
+  <div style="font-size:.8em;color:#64748b;margin-bottom:6px">WPS (PBC)</div>
+  <div class="toggle-group">
+    <label><input type="radio" name="wps_enable" value="true" {wps_true}><span>Enable</span></label>
+    <label><input type="radio" name="wps_enable" value="false" {wps_false}><span>Disable</span></label>
+  </div>
+  <p style="font-size:.78em;color:#aaa;margin:.25em 0 0;">When WPS is enabled and SSID is empty, WPS PBC is triggered on next boot.</p>
 </div>
 
 <!-- Network -->
@@ -776,6 +815,8 @@ document.getElementById('boot-log-overlay').addEventListener('click', function(e
 </body></html>"#,
         wifi_ssid     = esc(&cfg.wifi_ssid),
         wifi_psk      = esc(&cfg.wifi_psk),
+        wps_true      = chk(&cfg.wps_enable, "true"),
+        wps_false     = chk(&cfg.wps_enable, "false"),
         dhcp_chk      = chk(&cfg.ip_mode, "dhcp"),
         static_chk    = chk(&cfg.ip_mode, "static"),
         ip_address    = esc(&cfg.ip_address),
@@ -1065,6 +1106,7 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
         update!(cdc_enable,    "cdc_enable");
         update!(cdc_baud,      "cdc_baud");
         update!(display_port,  "display_port");
+        update!(wps_enable,    "wps_enable");
         update!(pwm_enable,    "pwm_enable");
         update!(ntp_server1,   "ntp_server1");
         update!(ntp_server2,   "ntp_server2");

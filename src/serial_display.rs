@@ -49,6 +49,19 @@ pub fn current_page() -> u8 {
     CURRENT_PAGE.load(Ordering::Relaxed)
 }
 
+// ─── System message overlay (for important notifications) ────────────────
+static SYSTEM_MESSAGE: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// Display a system message overlay (title + text).
+pub fn show_system_message(title: &str, text: &str) {
+    *SYSTEM_MESSAGE.lock().unwrap() = Some((title.to_string(), text.to_string()));
+}
+
+/// Clear the system message overlay.
+pub fn clear_system_message() {
+    *SYSTEM_MESSAGE.lock().unwrap() = None;
+}
+
 // ─── Shared info for Info page (set from main after init) ────────────────
 pub struct DisplayAux {
     pub status: crate::httpserver::StatusInfo,
@@ -688,6 +701,8 @@ fn display_task(
     let mut last_page = current_page();
     // For info page: track previous content to avoid flicker
     let mut prev_info_lines: Vec<String> = Vec::new();
+    // Track previous system message to detect changes
+    let mut prev_system_message: Option<(String, String)> = None;
 
     // Draw initial header
     draw_header(&mut display, last_page, &header_style);
@@ -702,30 +717,106 @@ fn display_task(
             *prev_cells = [[Cell::blank(); TERM_COLS]; TERM_ROWS];
         }
 
-        if force_full_redraw {
-            display.clear(Rgb565::BLACK).unwrap();
-            draw_header(&mut display, page, &header_style);
-            prev_info_lines.clear();
-        }
+        // ── Check for system message overlay ──────────────────────────
+        let sys_msg = SYSTEM_MESSAGE.lock().unwrap().clone();
+        
+        if let Some((title, text)) = sys_msg.clone() {
+            // Check if system message changed
+            let msg_changed = match &prev_system_message {
+                Some((prev_title, prev_text)) => prev_title != &title || prev_text != &text,
+                None => true, // First time showing system message
+            };
+            
+            // System message is active — draw it, force clear only if changed
+            draw_system_message(&mut display, &title, &text, &header_style, msg_changed);
+            prev_system_message = Some((title, text));
+        } else {
+            // Normal display mode
+            // If we just exited system message mode, force redraw
+            if prev_system_message.is_some() {
+                force_full_redraw = true;
+                prev_system_message = None;
+            }
+            
+            if force_full_redraw {
+                display.clear(Rgb565::BLACK).unwrap();
+                draw_header(&mut display, page, &header_style);
+                prev_info_lines.clear();
+            }
 
-        match page {
-            PAGE_INFO => {
-                draw_info_page(&mut display, force_full_redraw, &mut prev_info_lines);
+            match page {
+                PAGE_INFO => {
+                    draw_info_page(&mut display, force_full_redraw, &mut prev_info_lines);
+                }
+                PAGE_COM1 => {
+                    draw_terminal_page(&mut display, &com1_buf, &mut prev_cells, force_full_redraw);
+                }
+                PAGE_COM2 => {
+                    draw_terminal_page(&mut display, &com2_buf, &mut prev_cells, force_full_redraw);
+                }
+                PAGE_USB => {
+                    draw_terminal_page(&mut display, &usb_buf, &mut prev_cells, force_full_redraw);
+                }
+                _ => {}
             }
-            PAGE_COM1 => {
-                draw_terminal_page(&mut display, &com1_buf, &mut prev_cells, force_full_redraw);
-            }
-            PAGE_COM2 => {
-                draw_terminal_page(&mut display, &com2_buf, &mut prev_cells, force_full_redraw);
-            }
-            PAGE_USB => {
-                draw_terminal_page(&mut display, &usb_buf, &mut prev_cells, force_full_redraw);
-            }
-            _ => {}
         }
 
         force_full_redraw = false;
         thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+// ─── System message overlay drawing ──────────────────────────────────────
+
+fn draw_system_message<D: DrawTarget<Color = Rgb565>>(
+    display: &mut D,
+    title: &str,
+    text: &str,
+    header_style: &MonoTextStyle<Rgb565>,
+    force_clear: bool,
+) {
+    // Only full clear and redraw header on first display or when message changes
+    if force_clear {
+        let _ = display.clear(Rgb565::BLACK);
+        
+        // Draw title in header
+        let _ = Text::new(title, Point::new(4, 16), *header_style).draw(display);
+        let _ = Rectangle::new(Point::new(0, HEADER_H), Size::new(320, 1))
+            .into_styled(PrimitiveStyle::with_fill(Rgb565::CSS_DARK_GREEN))
+            .draw(display);
+        
+        // Clear message area once
+        let _ = Rectangle::new(Point::new(0, HEADER_H + 1), Size::new(320, 240 - HEADER_H as u32 - 1))
+            .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+            .draw(display);
+    }
+    
+    // Draw message text with background color to overwrite old text without clearing
+    let msg_style = MonoTextStyleBuilder::new()
+        .font(&FONT_10X20)
+        .text_color(Rgb565::YELLOW)
+        .background_color(Rgb565::BLACK)
+        .build();
+    
+    // Draw text lines - background color ensures old text is overwritten
+    let y_start = 80;
+    let lines: Vec<&str> = text.lines().collect();
+    
+    // Draw actual lines
+    for (i, line) in lines.iter().enumerate() {
+        let y = y_start + (i as i32 * 24);
+        // Pad line to full width to ensure complete overwrite of previous text
+        let padded = format!("{:<40}", line);  // Pad to ~40 chars (covers ~240px with 6px font width)
+        let _ = Text::new(&padded, Point::new(10, y), msg_style).draw(display);
+    }
+    
+    // Clear any remaining lines that were used before but not now (if not force_clear)
+    if !force_clear && lines.len() < 6 {
+        for i in lines.len()..6 {
+            let y = y_start + (i as i32 * 24);
+            let blank = format!("{:<40}", "");
+            let _ = Text::new(&blank, Point::new(10, y), msg_style).draw(display);
+        }
     }
 }
 
