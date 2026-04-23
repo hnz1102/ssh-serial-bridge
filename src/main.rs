@@ -350,8 +350,8 @@ fn main() {
     let mut adc14_pin = AdcChannelDriver::new(&adc2, peripherals.pins.gpio14, &adc_config).unwrap();
 
     // ── GPIO1 input: power source detection (HIGH=DC jack, LOW=USB) ───────
-    let mut gpio1_power = PinDriver::input(peripherals.pins.gpio1).unwrap();
-    gpio1_power.set_pull(Pull::Up).unwrap();
+    let gpio1_power = PinDriver::input(peripherals.pins.gpio1).unwrap();
+    // gpio1_power.set_pull(Pull::Up).unwrap();　// ESP32-S3 has an internal pull-up on GPIO1, so external pull-up is not required for reliable reading. Enable if needed.
     let power_from_dc = gpio1_power.is_high();
     if power_from_dc {
         info!("Power source: DC jack input");
