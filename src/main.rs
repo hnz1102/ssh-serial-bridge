@@ -82,6 +82,8 @@ pub struct Config {
     ntp_server3: &'static str,
     #[default("ntp.nict.jp")]
     ntp_server4: &'static str,
+    #[default("80.098")]
+    adc_conversion_factor: &'static str,
 }
 
 fn main() {
@@ -133,6 +135,9 @@ fn main() {
         ntp_server4:   CONFIG.ntp_server4.to_string(),
     };
     let mut nvs_config = httpserver::load_config(cfg_defaults.clone());
+
+    // Parse ADC conversion factor from config (not stored in NVS)
+    let adc_conversion_factor: f32 = CONFIG.adc_conversion_factor.parse().unwrap_or(80.098);
 
     // Create GPIO/PWM shared state (used by button control, display, and HTTP server)
     let gpio_pwm_state = gpio_ctrl::GpioPwmState::new();
@@ -381,6 +386,9 @@ fn main() {
     }
     let mut last_power_from_dc = power_from_dc;
 
+    // ADC conversion factor (from config) is applied in the main loop during voltage reading to convert raw ADC values to volts.
+    info!("ADC conversion factor: {} (raw ADC value / this factor = voltage in volts)", adc_conversion_factor);
+
     // ── Internal temperature sensor init ──────────────────────────────────
     let temp_cfg = TempSensorConfig::default();
     let mut temp_sensor = TempSensorDriver::new(&temp_cfg, peripherals.temp_sensor).unwrap();
@@ -417,8 +425,12 @@ fn main() {
         }
 
         if count % 50 == 0 {
-            let dc_in_voltage : f32 =  adc2.read(&mut adc13_pin).unwrap() as f32/ 80.098; // Already adjusted conversion factor for voltage divider
-            let dc_out_voltage : f32 =  adc2.read(&mut adc14_pin).unwrap() as f32 / 80.098; // Already adjusted conversion factor for voltage divider
+            
+            let dc_in_raw = adc2.read(&mut adc13_pin).unwrap();
+            let dc_in_voltage : f32 = dc_in_raw as f32 / adc_conversion_factor; // Conversion factor from cfg.toml
+            let dc_out_raw = adc2.read(&mut adc14_pin).unwrap();
+            let dc_out_voltage : f32 = dc_out_raw as f32 / adc_conversion_factor; // Conversion factor from cfg.toml
+            // info!("Raw ADC13: {}, Voltage: {:.2} V; Raw ADC14: {}, Voltage: {:.2} V", dc_in_raw, dc_in_voltage, dc_out_raw, dc_out_voltage);
             dev_status.set_voltages(dc_in_voltage, dc_out_voltage);
             let temp_str = match temp_sensor.get_celsius() {
                 Ok(t) => { dev_status.set_chip_temp(t); format!("{:.1} °C", t) },

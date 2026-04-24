@@ -35,3 +35,5 @@ ntp_server1 = "time.aws.com"
 ntp_server2 = "time.google.com"
 ntp_server3 = "time.cloudflare.com"
 ntp_server4 = "ntp.nict.jp"
+
+adc_conversion_factor = "74.47"
