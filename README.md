@@ -142,6 +142,10 @@ com2_baud   = "115200"
 cdc_enable = "false"
 cdc_baud   = "115200"
 
+# CDC retry settings (for slow-initializing devices like Raspberry Pi USB Gadget)
+cdc_retry_enable   = "true"    # Automatically retry CDC-ACM init until device is ready
+cdc_retry_interval = "5"       # Seconds between retries (recommended: 5)
+
 display_enable = "false"
 display_port   = "com1"    # "com1" / "com2" / "usb0" / "usb1" / "usb2" / "usb3"
 
@@ -152,6 +156,8 @@ ntp_server1 = "time.aws.com"
 ntp_server2 = "time.google.com"
 ntp_server3 = "time.cloudflare.com"
 ntp_server4 = "ntp.nict.jp"
+
+adc_conversion_factor = "74.47"　＃Factor to convert ADC reading to voltage (depends on voltage divider and reference voltage)
 ```
 
 Values in `cfg.toml` are compiled into the firmware as defaults.  
@@ -521,6 +527,58 @@ in `cfg.toml` (default: `115200`).
 | **FT232H** | `0403` | `6014` | 1 | FTDI |
 | **FT2232H/D** | `0403` | `6010` | 2 | FTDI — maps to `usb0` / `usb1` |
 | **FT4232H** | `0403` | `6011` | 4 | FTDI — maps to `usb0`–`usb3` |
+
+### Linux USB Gadget (Raspberry Pi)
+
+This firmware supports **Raspberry Pi USB Gadget mode** for direct serial access over USB:
+
+| Device | VID | PID | Module | Notes |
+|--------|-----|-----|--------|-------|
+| **Raspberry Pi (g_cdc)** | `0525` | `a4a7` | `g_cdc` | CDC-ACM composite device (recommended) |
+
+#### Raspberry Pi Configuration
+
+To use your Raspberry Pi as a USB serial gadget with this ESP32-S3 bridge:
+
+1. **Enable USB gadget mode** on your Raspberry Pi:
+   ```bash
+   # Add to /boot/config.txt (or /boot/firmware/config.txt on Ubuntu)
+   dtoverlay=dwc2
+   ```
+
+2. **Load the g_cdc module** (recommended over g_serial):
+   
+   **Method A: Using cmdline.txt (Recommended)**
+   ```bash
+   # Edit /boot/cmdline.txt (or /boot/firmware/cmdline.txt on Ubuntu)
+   # Add modules-load=dwc2,g_cdc to the kernel command line
+   # Example:
+   console=serial0,115200 ... modules-load=dwc2,g_cdc ...
+   ```
+   
+   **Method B: Using /etc/modules**
+   ```bash
+   # Add to /etc/modules
+   dwc2
+   g_cdc
+   ```
+
+3. **Enable serial-getty service** (required for the CDC device to respond):
+   ```bash
+   sudo systemctl enable serial-getty@ttyGS0
+   sudo systemctl start serial-getty@ttyGS0
+   ```
+
+4. **Reboot your Raspberry Pi**:
+   ```bash
+   sudo reboot
+   ```
+
+5. **Connect the Pi to the ESP32-S3 USB port** using a USB cable
+
+> **Important:** Use `g_cdc` instead of `g_serial`. The `g_serial` module has compatibility issues with the ESP-IDF USB Host stack and may not work reliably. `g_cdc` provides better standards compliance and works seamlessly with this firmware.
+
+After configuration, the Pi will appear as a CDC-ACM device and you can access its serial console via SSH to the ESP32-S3 bridge (target: `usb0`).
 
 ### Port mapping
 

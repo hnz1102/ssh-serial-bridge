@@ -51,6 +51,11 @@ static CDC_PORT_EP_OUT: [AtomicU8; MAX_USB_PORTS] = [
     AtomicU8::new(0), AtomicU8::new(0),
     AtomicU8::new(0), AtomicU8::new(0),
 ];
+/// Per-port bulk-IN endpoint address (used to clear-halt on errors).
+static CDC_PORT_EP_IN: [AtomicU8; MAX_USB_PORTS] = [
+    AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0),
+];
 /// Per-port pre-allocated bulk-OUT transfer (set in handle_new_device).
 static mut CDC_PORT_OUT_XFER: [*mut usb_transfer_t; MAX_USB_PORTS] = [core::ptr::null_mut(); MAX_USB_PORTS];
 /// Number of active USB CDC ports (1 for single-port, 2–4 for multi-port FTDI).
@@ -61,6 +66,10 @@ static SSH_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 static CDC_ENABLED: AtomicBool = AtomicBool::new(false);
 /// CDC baud rate (set at startup from config, default 115200).
 static CDC_BAUD: AtomicU32 = AtomicU32::new(115200);
+/// Whether to retry CDC connection on startup (for devices like Raspberry Pi that need time to initialize).
+static CDC_RETRY_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Interval in seconds between CDC connection retries.
+static CDC_RETRY_INTERVAL: AtomicU8 = AtomicU8::new(5);
 /// True when the connected device is FTDI (needs 2-byte modem status stripping).
 static IS_FTDI: AtomicBool = AtomicBool::new(false);
 /// Shared GPIO/PWM state — written by SSH callbacks, read by main loop.
@@ -647,8 +656,21 @@ unsafe fn usb_cdc_write_port(port: usize, data: *const u8, len: usize) {
 
     let ret = usb_host_transfer_submit(xfer);
     if ret != ESP_OK as i32 {
-        warn!("[USB] bulk-OUT submit failed (port {}): 0x{:x}", port, ret);
-        CDC_PORT_OUT_BUSY[port].store(false, Ordering::Release);
+        // 0x103 INVALID_STATE typically means the OUT pipe is in halted state.
+        // Try to recover by clearing the halt and re-submitting once.
+        let ep_out = CDC_PORT_EP_OUT[port].load(Ordering::Relaxed);
+        let cleared = ep_clear_halt(dev_hdl, ep_out);
+        let ret2 = if cleared {
+            usb_host_transfer_submit(xfer)
+        } else { ret };
+        if ret2 != ESP_OK as i32 {
+            static OUT_FAIL_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = OUT_FAIL_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                warn!("[USB] bulk-OUT submit failed (port {}): 0x{:x}", port, ret2);
+            }
+            CDC_PORT_OUT_BUSY[port].store(false, Ordering::Release);
+        }
     }
 }
 
@@ -694,7 +716,11 @@ unsafe extern "C" fn bulk_out_cb(transfer: *mut usb_transfer_t) {
     let xfer = &*transfer;
     let port = xfer.context as usize;
     if xfer.status != usb_transfer_status_t_USB_TRANSFER_STATUS_COMPLETED {
-        warn!("[USB] bulk OUT error status={} port={}", xfer.status, port);
+        static OUT_ERR_COUNT: AtomicU32 = AtomicU32::new(0);
+        let n = OUT_ERR_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n == 0 {
+            warn!("[USB] bulk OUT error status={} port={}", xfer.status, port);
+        }
     }
     // Release the TX slot so the next write can proceed
     if port < MAX_USB_PORTS {
@@ -702,14 +728,96 @@ unsafe extern "C" fn bulk_out_cb(transfer: *mut usb_transfer_t) {
     }
 }
 
+/// Consecutive bulk-IN error count — used to throttle resubmits on persistent failures.
+static BULK_IN_ERR_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Recover a halted endpoint pipe.  After a STALL or transaction-error on a
+/// bulk endpoint, the ESP-IDF host pipe is in HALTED state and any further
+/// `usb_host_transfer_submit` returns `ESP_ERR_INVALID_STATE` (0x103). The
+/// proper recovery sequence per the ESP-IDF API is HALT → FLUSH → CLEAR.
+/// (HALT is required because CLEAR refuses to operate on a non-halted pipe;
+/// HALT is idempotent if already halted.)  We additionally send a standard
+/// USB CLEAR_FEATURE(ENDPOINT_HALT) request so the device-side data toggle
+/// is reset too — otherwise the very next packet may STALL again because the
+/// device still considers its own endpoint halted.
+unsafe fn ep_clear_halt(dev_hdl: usb_device_handle_t, ep_addr: u8) -> bool {
+    if ep_addr == 0 || dev_hdl.is_null() { return false; }
+    // Best-effort: ignore individual return codes — we just want the pipe
+    // back into ACTIVE state so submits work again.
+    let _ = usb_host_endpoint_halt(dev_hdl, ep_addr);
+    let _ = usb_host_endpoint_flush(dev_hdl, ep_addr);
+    let r = usb_host_endpoint_clear(dev_hdl, ep_addr);
+    r == ESP_OK as i32
+}
+
+/// Send standard USB CLEAR_FEATURE(ENDPOINT_HALT) to the device for a given
+/// endpoint address.  Returns ESP_OK on success.  Required after a STALL on
+/// bulk endpoints because clearing only the host-side pipe leaves the device
+/// in halted state (next IN packet will STALL again immediately).
+unsafe fn ep_clear_halt_device(
+    client: usb_host_client_handle_t,
+    ctrl_xfer: *mut usb_transfer_t,
+    dev_hdl: usb_device_handle_t,
+    ep_addr: u8,
+    verbose: bool,
+) -> i32 {
+    if ep_addr == 0 { return ESP_FAIL as i32; }
+    // bmRequestType=0x02 (host→dev, standard, endpoint),
+    // bRequest=0x01 CLEAR_FEATURE, wValue=0 (ENDPOINT_HALT), wIndex=ep_addr.
+    let (ret, _) = ctrl_transfer_sync(
+        client, ctrl_xfer, dev_hdl,
+        0x02, 0x01, 0x0000, ep_addr as u16, 0,
+        &[], &mut [], 1000,
+    );
+    if verbose && ret != ESP_OK as i32 {
+        warn!("[USB] CLEAR_FEATURE(EP 0x{:02x}) failed: 0x{:x}", ep_addr, ret);
+    }
+    ret
+}
+
+/// Full recovery: clear halt on host pipe AND device endpoint.
+unsafe fn ep_recover(
+    client: usb_host_client_handle_t,
+    ctrl_xfer: *mut usb_transfer_t,
+    dev_hdl: usb_device_handle_t,
+    ep_addr: u8,
+) -> bool {
+    if ep_addr == 0 { return false; }
+    let host_ok = ep_clear_halt(dev_hdl, ep_addr);
+    CTRL_QUIET.store(true, Ordering::Relaxed);
+    let dev_ret = ep_clear_halt_device(client, ctrl_xfer, dev_hdl, ep_addr, false);
+    CTRL_QUIET.store(false, Ordering::Relaxed);
+    host_ok && dev_ret == ESP_OK as i32
+}
+/// When true, ctrl_transfer_sync suppresses status-error logging. Used by
+/// the periodic CDC-ACM re-init retry path so syslog isn't flooded with
+/// the same STALL message every few seconds while a Linux gadget is booting.
+static CTRL_QUIET: AtomicBool = AtomicBool::new(false);
+/// Set by bulk_in_cb when transfer needs to be re-submitted by main loop
+/// (after a delay) instead of immediately. Prevents tight error loops.
+static BULK_IN_NEEDS_RESUBMIT: [AtomicBool; MAX_USB_PORTS] = [
+    AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false),
+];
+
 /// Bulk-IN transfer completion callback (port-aware via context).
 unsafe extern "C" fn bulk_in_cb(transfer: *mut usb_transfer_t) {
     let xfer = &*transfer;
     let port = xfer.context as usize;
     let device_id = usb_port_device_id(port);
-    if xfer.status == usb_transfer_status_t_USB_TRANSFER_STATUS_COMPLETED
-        && xfer.actual_num_bytes > 0
-    {
+    if xfer.status == usb_transfer_status_t_USB_TRANSFER_STATUS_COMPLETED {
+        // Reset error counter on success
+        BULK_IN_ERR_COUNT.store(0, Ordering::Relaxed);
+        
+        // Handle zero-length packets (valid USB packets, often used as keep-alive)
+        if xfer.actual_num_bytes == 0 {
+            // Re-submit immediately without processing
+            if !DEV_GONE.load(Ordering::Relaxed) {
+                usb_host_transfer_submit(transfer);
+            }
+            return;
+        }
+        
         let len = xfer.actual_num_bytes as usize;
         let count = DATA_RX_COUNT.fetch_add(1, Ordering::Relaxed);
         let data = core::slice::from_raw_parts(xfer.data_buffer, len);
@@ -729,7 +837,6 @@ unsafe extern "C" fn bulk_in_cb(transfer: *mut usb_transfer_t) {
         };
         // Forward received data to the SSH bridge (USB CDC → SSH)
         if fwd_len > 0 && ACTIVE_DEVICE.load(Ordering::Relaxed) == device_id {
-            // info!("[RX] usb{} {} bytes", port, fwd_len);
             ssh_bridge_cdc_rx(fwd_ptr, fwd_len);
         }
         // Mirror to USB display buffer (always, regardless of display page)
@@ -740,15 +847,23 @@ unsafe extern "C" fn bulk_in_cb(transfer: *mut usb_transfer_t) {
             // Broadcast to WebSocket terminals monitoring USB port
             ws_enqueue(device_id, core::slice::from_raw_parts(fwd_ptr, fwd_len));
         }
-    } else if xfer.status != usb_transfer_status_t_USB_TRANSFER_STATUS_CANCELED {
-        static LOGGED: AtomicBool = AtomicBool::new(false);
-        if !LOGGED.swap(true, Ordering::Relaxed) {
-            warn!("[USB] bulk IN error status={} port={}", xfer.status, port);
+        // Re-submit for next packet (unless device is gone)
+        if !DEV_GONE.load(Ordering::Relaxed) {
+            usb_host_transfer_submit(transfer);
         }
-    }
-    // Re-submit for next packet (unless device is gone)
-    if !DEV_GONE.load(Ordering::Relaxed) {
-        usb_host_transfer_submit(transfer);
+    } else if xfer.status == usb_transfer_status_t_USB_TRANSFER_STATUS_CANCELED {
+        // Cancellation — don't resubmit, don't log
+    } else {
+        // Error path: do NOT resubmit immediately (would tight-loop on STALL).
+        // Defer to main loop, which will sleep and retry after CDC-ACM re-init.
+        let errs = BULK_IN_ERR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if errs == 1 {
+            warn!("[USB] bulk IN error status={} port={} — retrying via CDC-ACM init",
+                  xfer.status, port);
+        }
+        if port < MAX_USB_PORTS {
+            BULK_IN_NEEDS_RESUBMIT[port].store(true, Ordering::Release);
+        }
     }
 }
 
@@ -823,8 +938,10 @@ unsafe fn ctrl_transfer_sync(
 
     let status = CTRL_STATUS.load(Ordering::SeqCst);
     if status != usb_transfer_status_t_USB_TRANSFER_STATUS_COMPLETED {
-        info!("[USB] ctrl xfer status={} (bmReq=0x{:02x} bReq=0x{:02x})",
-              status, bm_request_type, b_request);
+        if !CTRL_QUIET.load(Ordering::Relaxed) {
+            info!("[USB] ctrl xfer status={} (bmReq=0x{:02x} bReq=0x{:02x})",
+                  status, bm_request_type, b_request);
+        }
         return (ESP_FAIL as i32, 0);
     }
 
@@ -1125,14 +1242,31 @@ unsafe fn ftdi_init(
 /// `comm_intf` is the CDC Communication Class Interface number to use as
 /// wIndex in class requests (0 for single-interface devices, typically
 /// data_intf - 1 for 2-interface devices like 0x0525/0xA4A7).
+/// Returns `true` if CDC-ACM initialisation succeeded (both control requests accepted).
 unsafe fn cdc_acm_init(
     client: usb_host_client_handle_t,
     ctrl_xfer: *mut usb_transfer_t,
     dev_hdl: usb_device_handle_t,
     comm_intf: u8,
     baud_rate: u32,
-) {
+) -> bool {
+    cdc_acm_init_ext(client, ctrl_xfer, dev_hdl, comm_intf, baud_rate, true)
+}
+
+/// Internal CDC-ACM init with optional verbose logging.
+unsafe fn cdc_acm_init_ext(
+    client: usb_host_client_handle_t,
+    ctrl_xfer: *mut usb_transfer_t,
+    dev_hdl: usb_device_handle_t,
+    comm_intf: u8,
+    baud_rate: u32,
+    verbose: bool,
+) -> bool {
     let wi = comm_intf as u16;
+    let mut ok = true;
+
+    // Suppress per-request status logging when running silently.
+    CTRL_QUIET.store(!verbose, Ordering::Relaxed);
 
     // SetLineCoding: 8N1
     let mut slc = [0u8; 7];
@@ -1145,17 +1279,70 @@ unsafe fn cdc_acm_init(
         0x21, 0x20, 0, wi, 7,
         &slc, &mut [], 2000,
     );
-    info!("[USB] CDC-ACM SetLineCoding {} 8N1 (intf {}): 0x{:x}", baud_rate, comm_intf, ret);
+    if ret != ESP_OK as i32 {
+        if verbose {
+            warn!("[USB] CDC-ACM SetLineCoding {} 8N1 (comm intf {}) failed: 0x{:x}", baud_rate, comm_intf, ret);
+        }
+        // Try data interface too — some Linux gadgets (g_serial) may be non-standard
+        let data_intf = (comm_intf + 1) as u16;
+        let (ret2, _) = ctrl_transfer_sync(
+            client, ctrl_xfer, dev_hdl,
+            0x21, 0x20, 0, data_intf, 7,
+            &slc, &mut [], 2000,
+        );
+        if ret2 != ESP_OK as i32 {
+            if verbose {
+                warn!("[USB] CDC-ACM SetLineCoding (data intf {}) also failed: 0x{:x}", comm_intf + 1, ret2);
+            }
+            ok = false;
+        } else {
+            if verbose {
+                info!("[USB] CDC-ACM SetLineCoding {} 8N1 (data intf {}): OK", baud_rate, comm_intf + 1);
+            }
+        }
+    } else if verbose {
+        info!("[USB] CDC-ACM SetLineCoding {} 8N1 (comm intf {}): OK", baud_rate, comm_intf);
+    }
 
     // SetControlLineState: DTR + RTS
+    // Send to communication interface (standard CDC-ACM)
     let (ret, _) = ctrl_transfer_sync(
         client, ctrl_xfer, dev_hdl,
         0x21, 0x22, 0x0003, wi, 0,
         &[], &mut [], 2000,
     );
-    info!("[USB] CDC-ACM SetControlLineState DTR+RTS: 0x{:x}", ret);
+    if ret != ESP_OK as i32 {
+        if verbose {
+            warn!("[USB] CDC-ACM SetControlLineState DTR+RTS (comm intf {}) failed: 0x{:x}", comm_intf, ret);
+        }
+        // Try data interface too — some Linux gadgets (g_serial) may expect it there
+        let data_intf = (comm_intf + 1) as u16;
+        let (ret2, _) = ctrl_transfer_sync(
+            client, ctrl_xfer, dev_hdl,
+            0x21, 0x22, 0x0003, data_intf, 0,
+            &[], &mut [], 2000,
+        );
+        if ret2 != ESP_OK as i32 {
+            if verbose {
+                warn!("[USB] CDC-ACM SetControlLineState DTR+RTS (data intf {}) also failed: 0x{:x}", comm_intf + 1, ret2);
+            }
+            ok = false;
+        } else {
+            if verbose {
+                info!("[USB] CDC-ACM SetControlLineState DTR+RTS (data intf {}): OK", comm_intf + 1);
+            }
+            // Success on data interface — acceptable
+        }
+    } else if verbose {
+        info!("[USB] CDC-ACM SetControlLineState DTR+RTS (comm intf {}): OK", comm_intf);
+    }
 
-    info!("[USB] CDC-ACM init complete");
+    CTRL_QUIET.store(false, Ordering::Relaxed);
+
+    if ok && verbose {
+        info!("[USB] CDC-ACM init complete");
+    }
+    ok
 }
 
 // ─── Descriptor parsing ───────────────────────────────────────────────────────
@@ -1163,6 +1350,8 @@ unsafe fn cdc_acm_init(
 /// Bulk endpoint info.
 struct BulkEndpoints {
     intf_num: u8,
+    intf_class: u8,
+    intf_subclass: u8,
     ep_in: u8,
     ep_out: u8,
     mps: u16,
@@ -1177,6 +1366,8 @@ unsafe fn find_all_bulk_eps(config_desc: *const usb_config_desc_t) -> Vec<BulkEn
     let mut offset = 0usize;
     let mut results: Vec<BulkEndpoints> = Vec::new();
     let mut cur_intf: u8 = 0;
+    let mut cur_class: u8 = 0;
+    let mut cur_subclass: u8 = 0;
     let mut cur_ep_in: Option<(u8, u16)> = None;   // (addr, mps)
     let mut cur_ep_out: Option<u8> = None;          // addr
     let mut seen_first_intf = false;
@@ -1192,6 +1383,8 @@ unsafe fn find_all_bulk_eps(config_desc: *const usb_config_desc_t) -> Vec<BulkEn
                 if let (Some((in_addr, mps)), Some(out_addr)) = (cur_ep_in, cur_ep_out) {
                     results.push(BulkEndpoints {
                         intf_num: cur_intf,
+                        intf_class: cur_class,
+                        intf_subclass: cur_subclass,
                         ep_in: in_addr,
                         ep_out: out_addr,
                         mps,
@@ -1199,6 +1392,8 @@ unsafe fn find_all_bulk_eps(config_desc: *const usb_config_desc_t) -> Vec<BulkEn
                 }
             }
             cur_intf = *base.add(offset + 2);
+            cur_class = *base.add(offset + 5);
+            cur_subclass = *base.add(offset + 6);
             cur_ep_in = None;
             cur_ep_out = None;
             seen_first_intf = true;
@@ -1221,6 +1416,8 @@ unsafe fn find_all_bulk_eps(config_desc: *const usb_config_desc_t) -> Vec<BulkEn
     if let (Some((in_addr, mps)), Some(out_addr)) = (cur_ep_in, cur_ep_out) {
         results.push(BulkEndpoints {
             intf_num: cur_intf,
+            intf_class: cur_class,
+            intf_subclass: cur_subclass,
             ep_in: in_addr,
             ep_out: out_addr,
             mps,
@@ -1289,15 +1486,39 @@ fn usb_client_task() {
 
     // Check for devices already connected before client was registered
     // (NEW_DEV event only fires for devices enumerated *after* registration)
-    unsafe {
-        let mut addrs = [0u8; 8];
-        let mut num: i32 = 0;
-        if usb_host_device_addr_list_fill(8, addrs.as_mut_ptr(), &mut num) == ESP_OK as i32
-            && num > 0
-        {
-            info!("[USB] {} device(s) already connected", num);
-            NEW_DEV_ADDR.store(addrs[0], Ordering::SeqCst);
+    // If CDC retry is enabled and no device is found, retry indefinitely.
+    let retry_enabled = CDC_RETRY_ENABLED.load(Ordering::Relaxed);
+    let retry_interval_secs = CDC_RETRY_INTERVAL.load(Ordering::Relaxed) as u64;
+    let mut retry_count = 0;
+    
+    loop {
+        unsafe {
+            let mut addrs = [0u8; 8];
+            let mut num: i32 = 0;
+            if usb_host_device_addr_list_fill(8, addrs.as_mut_ptr(), &mut num) == ESP_OK as i32
+                && num > 0
+            {
+                if retry_count > 0 {
+                    info!("[USB] {} device(s) found after {} attempts", num, retry_count);
+                } else {
+                    info!("[USB] {} device(s) found", num);
+                }
+                NEW_DEV_ADDR.store(addrs[0], Ordering::SeqCst);
+                break;
+            }
         }
+        
+        retry_count += 1;
+        if !retry_enabled {
+            if retry_count > 1 {
+                info!("[USB] No device found, waiting for hotplug...");
+            }
+            break;
+        }
+        
+        info!("[USB] No device found, retrying in {} seconds... (attempt {})", 
+              retry_interval_secs, retry_count);
+        thread::sleep(Duration::from_secs(retry_interval_secs));
     }
 
     loop {
@@ -1316,8 +1537,12 @@ fn usb_client_task() {
         unsafe {
             handle_new_device(client, ctrl_xfer, addr);
         }
-        // After handle_new_device returns (device removed), loop back
+        // After handle_new_device returns (real device unplug), loop back and
+        // wait for the next NEW_DEV event. Bulk-IN errors no longer force a
+        // close — main loop retries CDC-ACM init + bulk-IN submission instead.
         DATA_RX_COUNT.store(0, Ordering::Relaxed);
+        BULK_IN_ERR_COUNT.store(0, Ordering::Relaxed);
+        DEV_GONE.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1352,6 +1577,13 @@ unsafe fn handle_new_device(
             "[USB] VID=0x{:04x} PID=0x{:04x} bcdDevice=0x{:04x} class=0x{:02x}",
             vid, pid, bcd, cls
         );
+        // Linux USB Gadget default VID/PID — may need g_serial module
+        if vid == 0x0525 && (pid == 0xa4a7 || pid == 0xa4a6) {
+            info!("[USB] Detected Linux USB Gadget (Raspberry Pi?)");
+            info!("[USB] If device does not work, ensure g_serial is loaded:");
+            info!("[USB]   - Add 'dtoverlay=dwc2' to /boot/config.txt");
+            info!("[USB]   - Add 'g_serial' to /etc/modules or use modules-load=dwc2,g_serial");
+        }
     }
 
     // Config descriptor
@@ -1371,18 +1603,56 @@ unsafe fn handle_new_device(
         return;
     }
 
+    // Log all discovered bulk interfaces for diagnostics
+    for ep in &all_eps {
+        info!("[USB]   intf={} class=0x{:02x} subclass=0x{:02x} IN=0x{:02x} OUT=0x{:02x} MPS={}",
+              ep.intf_num, ep.intf_class, ep.intf_subclass, ep.ep_in, ep.ep_out, ep.mps);
+    }
+
     // Determine number of ports to use
     let vid = CDC_VID.load(Ordering::Acquire) as u16;
     let pid = CDC_PID.load(Ordering::Acquire) as u16;
     let baud = CDC_BAUD.load(Ordering::Relaxed);
     IS_FTDI.store(vid == 0x0403, Ordering::Release);
 
-    let port_count = if vid == 0x0403 {
-        ftdi_port_count(pid).min(all_eps.len()).min(MAX_USB_PORTS)
+    // For composite devices (e.g. Linux g_multi with RNDIS + CDC-ACM + Mass
+    // Storage), select only the CDC-ACM data interface (class 0x0A = CDC Data).
+    // Skip RNDIS data interfaces which also have class 0x0A but are preceded
+    // by RNDIS control (class 0x02, subclass 0x0D or 0xE0).
+    // For non-composite / vendor-class devices, use all endpoints as before.
+    let selected_eps: Vec<&BulkEndpoints> = if vid == 0x0403 {
+        // FTDI — use all (port count determined by ftdi_port_count)
+        all_eps.iter().collect()
+    } else if all_eps.len() > 1 {
+        // Composite device — prefer CDC Data class (0x0A)
+        let cdc_data: Vec<&BulkEndpoints> = all_eps.iter()
+            .filter(|ep| ep.intf_class == 0x0A)
+            .collect();
+        if cdc_data.len() > 1 {
+            // Multiple CDC Data interfaces (e.g. g_multi has RNDIS data + ACM data).
+            // Use the LAST one — on Linux composite gadgets, RNDIS data comes
+            // first, CDC-ACM serial data comes later.
+            info!("[USB] Composite device: {} CDC Data interfaces, selecting last (intf={})",
+                  cdc_data.len(), cdc_data.last().unwrap().intf_num);
+            vec![cdc_data.last().unwrap()]
+        } else if cdc_data.len() == 1 {
+            info!("[USB] Composite device: using CDC Data interface {}", cdc_data[0].intf_num);
+            cdc_data
+        } else {
+            // No class 0x0A interfaces — fall back to first bulk pair
+            info!("[USB] Composite device: no CDC Data class found, using first bulk pair");
+            vec![&all_eps[0]]
+        }
     } else {
-        1
+        all_eps.iter().collect()
     };
-    let eps_to_use = &all_eps[..port_count];
+
+    let port_count = if vid == 0x0403 {
+        ftdi_port_count(pid).min(selected_eps.len()).min(MAX_USB_PORTS)
+    } else {
+        1.min(selected_eps.len())
+    };
+    let eps_to_use = &selected_eps[..port_count];
 
     info!("[USB] {} port(s) detected (VID=0x{:04x} PID=0x{:04x})", port_count, vid, pid);
 
@@ -1406,8 +1676,8 @@ unsafe fn handle_new_device(
         claimed_intfs[port_idx] = eps.intf_num as i8;
 
         info!(
-            "[USB] Port {} — Bulk-IN 0x{:02x} Bulk-OUT 0x{:02x} MPS={} intf={}",
-            port_idx, eps.ep_in, eps.ep_out, eps.mps, eps.intf_num
+            "[USB] Port {} — Bulk-IN 0x{:02x} Bulk-OUT 0x{:02x} MPS={} intf={} class=0x{:02x}",
+            port_idx, eps.ep_in, eps.ep_out, eps.mps, eps.intf_num, eps.intf_class
         );
 
         // For standard CDC-ACM devices (not vendor-specific FTDI/PL2303/CP210x):
@@ -1430,12 +1700,20 @@ unsafe fn handle_new_device(
             0
         };
 
-        // Chip-specific init
+        // Chip-specific init.  For CDC-ACM, do a single attempt here — the
+        // main loop will keep retrying init periodically (every cdc_retry_interval
+        // seconds) for as long as bulk-IN errors persist.  This handles slow
+        // gadgets like Raspberry Pi where serial-getty may take 30s+ to start.
         match vid {
             0x067B => pl2303_init(client, ctrl_xfer, dev_hdl, baud),
             0x10C4 => cp210x_init(client, ctrl_xfer, dev_hdl, eps.intf_num, baud),
             0x0403 => ftdi_init(client, ctrl_xfer, dev_hdl, eps.intf_num, baud),
-            _      => cdc_acm_init(client, ctrl_xfer, dev_hdl, comm_intf, baud),
+            _ => {
+                if !cdc_acm_init(client, ctrl_xfer, dev_hdl, comm_intf, baud) {
+                    info!("[USB] CDC-ACM init failed initially — will retry from main loop");
+                    info!("[USB] (Linux gadget may not be ready until serial-getty starts)");
+                }
+            }
         }
 
         // Allocate bulk-IN transfer
@@ -1468,6 +1746,7 @@ unsafe fn handle_new_device(
         }
 
         CDC_PORT_EP_OUT[port_idx].store(eps.ep_out, Ordering::Release);
+        CDC_PORT_EP_IN[port_idx].store(eps.ep_in, Ordering::Release);
         active_ports += 1;
     }
 
@@ -1495,9 +1774,80 @@ unsafe fn handle_new_device(
 
     info!("[USB] {} port(s) active, bulk-IN polling started", active_ports);
 
+    // Reset resubmit flags
+    for i in 0..MAX_USB_PORTS {
+        BULK_IN_NEEDS_RESUBMIT[i].store(false, Ordering::Release);
+    }
+    BULK_IN_ERR_COUNT.store(0, Ordering::Relaxed);
+
+    // Save info needed for periodic CDC-ACM re-init (Linux gadgets become
+    // ready only after serial-getty/Ubuntu boot completes — could be 30s+).
+    let cdc_retry_interval = CDC_RETRY_INTERVAL.load(Ordering::Relaxed) as u64;
+    let needs_cdc_acm = !matches!(vid, 0x0403 | 0x067B | 0x10C4);
+    let mut last_retry = std::time::Instant::now();
+    let retry_period = Duration::from_secs(cdc_retry_interval.max(1));
+
     // Pump events until device is removed
     loop {
         usb_host_client_handle_events(client, 200);
+
+        // ── Handle deferred bulk-IN resubmits (after errors) ──────────────
+        // bulk_in_cb defers resubmission on error so the main loop can
+        // throttle and (optionally) re-init CDC-ACM before retrying.
+        let now = std::time::Instant::now();
+        if now.duration_since(last_retry) >= retry_period {
+            let mut any_pending = false;
+            for port_idx in 0..active_ports {
+                if BULK_IN_NEEDS_RESUBMIT[port_idx].load(Ordering::Acquire) {
+                    any_pending = true;
+                }
+            }
+            if any_pending {
+                let errs = BULK_IN_ERR_COUNT.load(Ordering::Relaxed);
+                // Periodically retry CDC-ACM init too — the gadget may have
+                // just become ready (e.g. serial-getty started on the Pi).
+                let mut cdc_now_ok = false;
+                if needs_cdc_acm {
+                    let comm_intf = if comm_intfs[0] >= 0 { comm_intfs[0] as u8 } else { 0 };
+                    let baud = CDC_BAUD.load(Ordering::Relaxed);
+                    // Silent retry: don't flood syslog with STALL messages
+                    // every retry_period seconds while gadget is booting.
+                    if cdc_acm_init_ext(client, ctrl_xfer, dev_hdl, comm_intf, baud, false) {
+                        cdc_now_ok = true;
+                        info!("[USB] CDC-ACM device ready (after {} bulk errors)", errs);
+                        // Re-run with full logging so the success is visible
+                        cdc_acm_init_ext(client, ctrl_xfer, dev_hdl, comm_intf, baud, true);
+                    }
+                }
+                // Re-submit pending bulk-IN transfers
+                for port_idx in 0..active_ports {
+                    if BULK_IN_NEEDS_RESUBMIT[port_idx].swap(false, Ordering::AcqRel) {
+                        let in_xfer = in_xfers[port_idx];
+                        if !in_xfer.is_null() {
+                            // Endpoint is in halted state after the error; clear-halt
+                            // first or submit will return INVALID_STATE forever.
+                            let ep_in = CDC_PORT_EP_IN[port_idx].load(Ordering::Relaxed);
+                            let ep_out = CDC_PORT_EP_OUT[port_idx].load(Ordering::Relaxed);
+                            
+                            ep_recover(client, ctrl_xfer, dev_hdl, ep_in);
+                            ep_recover(client, ctrl_xfer, dev_hdl, ep_out);
+
+                            let ret = usb_host_transfer_submit(in_xfer);
+                            if ret != ESP_OK as i32 {
+                                // Stay pending; will retry next period
+                                BULK_IN_NEEDS_RESUBMIT[port_idx].store(true, Ordering::Release);
+                            } else if cdc_now_ok {
+                                // Success after CDC init: reset error count
+                                BULK_IN_ERR_COUNT.store(0, Ordering::Relaxed);
+                                info!("[USB] Port {} ready — polling for data", port_idx);
+                            }
+                        }
+                    }
+                }
+            }
+            last_retry = now;
+        }
+
         if DEV_GONE.load(Ordering::SeqCst) {
             info!("[USB] Device gone — cleaning up {} port(s)", active_ports);
             // Invalidate CDC TX state before freeing
@@ -1510,7 +1860,9 @@ unsafe fn handle_new_device(
             for i in 0..MAX_USB_PORTS {
                 CDC_PORT_OUT_BUSY[i].store(false, Ordering::Release);
                 CDC_PORT_EP_OUT[i].store(0, Ordering::Release);
+                CDC_PORT_EP_IN[i].store(0, Ordering::Release);
                 CDC_PORT_OUT_XFER[i] = core::ptr::null_mut();
+                BULK_IN_NEEDS_RESUBMIT[i].store(false, Ordering::Release);
             }
             for i in 0..active_ports {
                 if !out_xfers[i].is_null() {
@@ -1669,6 +2021,8 @@ pub fn start(
     com2_tx: i32, com2_rx: i32, com2_baud: u32,
     cdc_enable: bool,
     cdc_baud: u32,
+    cdc_retry_enable: bool,
+    cdc_retry_interval: u8,
     gpio_pwm: GpioPwmState,
 ) {
     // Store GPIO/PWM state so SSH callbacks can reach it.
@@ -1710,7 +2064,10 @@ pub fn start(
     if cdc_enable {
         CDC_ENABLED.store(true, Ordering::SeqCst);
         CDC_BAUD.store(cdc_baud, Ordering::SeqCst);
-        log::info!("[USB] CDC host enabled (baud={})", cdc_baud);
+        CDC_RETRY_ENABLED.store(cdc_retry_enable, Ordering::SeqCst);
+        CDC_RETRY_INTERVAL.store(cdc_retry_interval, Ordering::SeqCst);
+        log::info!("[USB] CDC host enabled (baud={}, retry={}, interval={}s)", 
+                   cdc_baud, cdc_retry_enable, cdc_retry_interval);
 
         // Log heap status before USB host starts
         unsafe {
@@ -1744,6 +2101,6 @@ pub fn start_ssh_only(
     com2_tx: i32, com2_rx: i32, com2_baud: u32,
 ) {
     start(username, password, com1_tx, com1_rx, com1_baud,
-          com2_tx, com2_rx, com2_baud, false, 115200,
+          com2_tx, com2_rx, com2_baud, false, 115200, false, 5,
           crate::gpio_ctrl::GpioPwmState::new());
 }

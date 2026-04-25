@@ -43,6 +43,8 @@ pub struct NvsConfig {
     pub com2_baud:     String,
     pub cdc_enable:    String,
     pub cdc_baud:      String,
+    pub cdc_retry_enable: String,
+    pub cdc_retry_interval: String,
     pub display_enable: String,
     pub display_port:  String,
     pub wps_enable:    String,
@@ -230,6 +232,8 @@ pub fn load_config(defaults: NvsConfig) -> NvsConfig {
         com2_baud:     or(nvs_read("com2_baud"),     &defaults.com2_baud),
         cdc_enable:    or(nvs_read("cdc_enable"),    &defaults.cdc_enable),
         cdc_baud:      or(nvs_read("cdc_baud"),      &defaults.cdc_baud),
+        cdc_retry_enable: or(nvs_read("cdc_retry_enable"), &defaults.cdc_retry_enable),
+        cdc_retry_interval: or(nvs_read("cdc_retry_interval"), &defaults.cdc_retry_interval),
         display_enable: or(nvs_read("display_enable"), &defaults.display_enable),
         display_port:  or(nvs_read("display_port"),  &defaults.display_port),
         wps_enable:    or(nvs_read("wps_enable"),    &defaults.wps_enable),
@@ -1208,10 +1212,20 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
         // Clear session so the login page is shown after reconnect
         *state_rb.session.lock().unwrap() = None;
         request.into_ok_response()?.write_all(b"Rebooting...")?;
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        // Use Builder with explicit stack size — bare std::thread::spawn can
+        // silently fail on ESP-IDF when default stack is too small.
+        let spawned = std::thread::Builder::new()
+            .name("reboot".into())
+            .stack_size(2048)
+            .spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                unsafe { esp_restart(); }
+            });
+        if spawned.is_err() {
+            // Fallback: reboot directly if thread spawn failed
+            std::thread::sleep(std::time::Duration::from_millis(200));
             unsafe { esp_restart(); }
-        });
+        }
         Ok::<(), anyhow::Error>(())
     })?;
 

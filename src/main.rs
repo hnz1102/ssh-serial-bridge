@@ -69,6 +69,10 @@ pub struct Config {
     #[default("115200")]
     cdc_baud: &'static str,
     #[default("true")]
+    cdc_retry_enable: &'static str,
+    #[default("5")]
+    cdc_retry_interval: &'static str,
+    #[default("true")]
     display_enable: &'static str,
     #[default("com1")]
     display_port: &'static str,
@@ -126,6 +130,8 @@ fn main() {
         com2_baud:     CONFIG.com2_baud.to_string(),
         cdc_enable:    CONFIG.cdc_enable.to_string(),
         cdc_baud:      CONFIG.cdc_baud.to_string(),
+        cdc_retry_enable: CONFIG.cdc_retry_enable.to_string(),
+        cdc_retry_interval: CONFIG.cdc_retry_interval.to_string(),
         display_enable: CONFIG.display_enable.to_string(),
         display_port:  CONFIG.display_port.to_string(),
         pwm_enable:    CONFIG.pwm_enable.to_string(),
@@ -314,6 +320,8 @@ fn main() {
         nvs_config.com2_baud.parse().unwrap_or(115200),
         nvs_config.cdc_enable == "true",
         nvs_config.cdc_baud.parse().unwrap_or(115200),
+        nvs_config.cdc_retry_enable == "true",
+        nvs_config.cdc_retry_interval.parse().unwrap_or(5),
         gpio_pwm_state.clone(),
     );
 
