@@ -41,3 +41,5 @@ adc_conversion_factor = "74.47"
 # CDC retry: for devices like Raspberry Pi that take time to initialize USB after power-on
 cdc_retry_enable = "true"
 cdc_retry_interval = "5"  # seconds between retries (max 10 attempts)
+
+mini_display_enable = "false"
