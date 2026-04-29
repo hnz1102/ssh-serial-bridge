@@ -14,7 +14,7 @@ syslog_host_name = "esp32s3"
 syslog_app_name  = "ssh-bridge"
 
 ssh_user     = "admin"
-ssh_password = "esp32"
+ssh_password = "sshpass"
 
 com1_tx_pin = "17" # for XIAO-ESP32S3 43
 com1_rx_pin = "18" # for XIAO-ESP32S3 44
