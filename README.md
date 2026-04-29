@@ -328,6 +328,44 @@ cargo build --release
 espflash flash --release --monitor
 ```
 
+### Creating a complete flash binary image
+
+To create a single binary file that includes all partitions (bootloader, partition table, nvs, phy_init, and factory app) for distribution or web-based flashing:
+
+```bash
+cargo espflash save-image --release --merge --chip esp32s3 complete_flash.bin
+```
+
+This creates a complete 8 MB flash image starting from offset 0x0.
+
+**Important**: When flashing this image, always write it to **offset 0x0**, not 0x9000. Writing to 0x9000 will result in a boot failure with "invalid header: 0xffffffff" error.
+
+#### Flash the complete binary
+
+```bash
+# Using esptool.py
+esptool.py --chip esp32s3 --port /dev/ttyUSB0 write_flash 0x0 complete_flash.bin
+
+# Using espflash
+espflash write-bin 0x0 complete_flash.bin
+```
+
+#### Web-based flashing (no command line required)
+
+You can also flash the binary via a web browser using the ESP Web Flasher:
+
+1. Open [https://thelastoutpostworkshop.github.io/ESPConnect/](https://thelastoutpostworkshop.github.io/ESPConnect/) in Chrome, Edge, or Opera (Web Serial API required)
+2. Click **"Connect"** and select your ESP32-S3 device from the serial port list
+3. Click **"Choose File"** and select `complete_flash.bin`
+4. Set the flash address to **`0x0`** (very important!)
+5. Click **"Program"** to start flashing
+6. Wait for the process to complete and click **"Reset Device"**
+
+This method is ideal for:
+- Users without command-line tools installed
+- Quick firmware updates without installing the Rust/ESP toolchain
+- Distribution of pre-built binaries
+
 ### Flash layout
 
 | Partition     | Offset  | Size   |
