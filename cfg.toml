@@ -1,0 +1,46 @@
+[ssh-serial-bridge]
+# This configuration for XIAO-ESP32S3
+wps_enable     = "true"     # "true": use WPS PBC on next boot when SSID is empty
+wifi_ssid      = ""         # your-ssid
+wifi_psk       = ""         # your-password
+ip_mode        = "dhcp"           # "dhcp" or "static"
+ip_address     = "192.168.2.200"
+subnet_mask    = "255.255.255.0"
+gateway        = "192.168.2.1"
+dns            = "1.1.1.1"
+
+syslog_server    = "192.168.2.140:514"
+syslog_enable    = "false"
+syslog_host_name = "esp32s3"
+syslog_app_name  = "ssh-bridge"
+
+ssh_user     = "admin"
+ssh_password = "sshpass"
+
+com1_tx_pin = "43" # for XIAO-ESP32S3 43
+com1_rx_pin = "44" # for XIAO-ESP32S3 44
+com1_baud   = "115200"
+com2_tx_pin = "41"
+com2_rx_pin = "42"
+com2_baud   = "115200"
+
+cdc_enable = "false"
+cdc_baud   = "115200"
+
+display_enable = "false"
+display_port   = "com1"    # "com1" / "com2" / "usb"
+
+pwm_enable = "false"
+
+ntp_server1 = "time.aws.com"
+ntp_server2 = "time.google.com"
+ntp_server3 = "time.cloudflare.com"
+ntp_server4 = "ntp.nict.jp"
+
+adc_conversion_factor = "74.47"
+
+# CDC retry: for devices like Raspberry Pi that take time to initialize USB after power-on
+cdc_retry_enable = "true"
+cdc_retry_interval = "5"  # seconds between retries (max 10 attempts)
+
+mini_display_enable = "false"
