@@ -10,6 +10,7 @@ use esp_idf_hal::adc::attenuation::DB_11;
 use esp_idf_hal::adc::oneshot::{AdcDriver, AdcChannelDriver};
 use esp_idf_hal::adc::oneshot::config::AdcChannelConfig;
 use esp_idf_hal::temp_sensor::{TempSensorConfig, TempSensorDriver};
+use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
 use std::time::{Duration, SystemTime};
 use std::thread;
 
@@ -21,6 +22,7 @@ mod gpio_ctrl;
 pub mod serial_display;
 mod btn_ctrl;
 mod boot_log;
+mod mini_display;
 
 #[toml_cfg::toml_config]
 pub struct Config {
@@ -76,6 +78,8 @@ pub struct Config {
     display_enable: &'static str,
     #[default("com1")]
     display_port: &'static str,
+    #[default("false")]
+    mini_display_enable: &'static str,
     #[default("true")]
     pwm_enable: &'static str,
     #[default("time.aws.com")]
@@ -134,6 +138,7 @@ fn main() {
         cdc_retry_interval: CONFIG.cdc_retry_interval.to_string(),
         display_enable: CONFIG.display_enable.to_string(),
         display_port:  CONFIG.display_port.to_string(),
+        mini_display_enable: CONFIG.mini_display_enable.to_string(),
         pwm_enable:    CONFIG.pwm_enable.to_string(),
         ntp_server1:   CONFIG.ntp_server1.to_string(),
         ntp_server2:   CONFIG.ntp_server2.to_string(),
@@ -153,6 +158,28 @@ fn main() {
     // Medium press (3s ~ 10s): toggle DC OUT (GPIO12) ON/OFF
     // Very long press (≥ 10s): factory reset to cfg.toml defaults
     btn_ctrl::start_button_thread(peripherals.pins.gpio0, gpio_pwm_state.clone());
+
+    // ── Mini Display init (SSD1306, only when enabled) ────────────────────
+    if nvs_config.mini_display_enable == "true" {
+        info!("Initializing mini display (SSD1306)...");
+        let i2c_config = I2cConfig::new().baudrate(400.kHz().into());
+        match I2cDriver::new(
+            peripherals.i2c0,
+            peripherals.pins.gpio46,  // SDA
+            peripherals.pins.gpio3,   // SCL
+            &i2c_config,
+        ) {
+            Ok(i2c) => {
+                mini_display::start_mini_display_thread(i2c);
+                info!("Mini display (SSD1306) initialized");
+            }
+            Err(e) => {
+                info!("Failed to initialize I2C for mini display: {:?}", e);
+            }
+        }
+    } else {
+        info!("Mini display disabled");
+    }
 
     // ── Display init (only when enabled) ──────────────────────────────────
     if nvs_config.display_enable == "true" {
@@ -218,9 +245,22 @@ fn main() {
                     &nvs_config.wifi_ssid,
                     wifi::get_rssi(),
                 );
+                // Update mini display if enabled
+                if nvs_config.mini_display_enable == "true" {
+                    let com1_baud = nvs_config.com1_baud.parse().unwrap_or(0);
+                    let rssi = wifi::get_rssi() as i8;
+                    mini_display::update_display_info(true, &ip_info.ip.to_string(), rssi, 0.0, com1_baud);
+                }
             }
         },
-        Err(e) => println!("WiFi connect failed: {:?}", e),
+        Err(e) => {
+            println!("WiFi connect failed: {:?}", e);
+            // Update mini display if enabled (show disconnected state)
+            if nvs_config.mini_display_enable == "true" {
+                let com1_baud = nvs_config.com1_baud.parse().unwrap_or(0);
+                mini_display::update_display_info(false, "---", 0, 0.0, com1_baud);
+            }
+        }
     }
 
     // Start HTTP config server (login protected, NVS-backed settings)
@@ -404,6 +444,13 @@ fn main() {
 
     let mut count = 0u32;
     loop {
+        // Check connection state via EspWifi before calling get_rssi(),
+        // because esp_wifi_sta_get_rssi crashes (LoadProhibited) when
+        // WiFi is not connected.
+        let is_connected = wifi_dev.as_ref()
+            .map(|w| w.is_connected().unwrap_or(false))
+            .unwrap_or(false);
+
         // ── Apply GPIO 4-9 desired state ──────────────────────────────────
         {
             let states = gpio_pwm_state.get_gpio();
@@ -445,14 +492,22 @@ fn main() {
                 Err(_) => "--".to_string(),
             };
             info!("Internal temp: {}, DCIN: {:.2} V, DCOUT: {:.2} V", temp_str, dc_in_voltage, dc_out_voltage);
+            
+            // Update mini display with voltage info
+            if nvs_config.mini_display_enable == "true" {
+                let ip = if is_connected {
+                    wifi_dev.as_ref().ok()
+                        .and_then(|w| w.sta_netif().get_ip_info().ok())
+                        .map(|ip_info| ip_info.ip.to_string())
+                        .unwrap_or_else(|| "---".to_string())
+                } else {
+                    "---".to_string()
+                };
+                let rssi = if is_connected { wifi::get_rssi() as i8 } else { 0 };
+                let com1_baud = nvs_config.com1_baud.parse().unwrap_or(0);
+                mini_display::update_display_info(is_connected, &ip, rssi, dc_in_voltage, com1_baud);
+            }
         }
-
-        // Check connection state via EspWifi before calling get_rssi(),
-        // because esp_wifi_sta_get_rssi crashes (LoadProhibited) when
-        // WiFi is not connected.
-        let is_connected = wifi_dev.as_ref()
-            .map(|w| w.is_connected().unwrap_or(false))
-            .unwrap_or(false);
 
         if !is_connected {
             if count % 30 == 0 {
