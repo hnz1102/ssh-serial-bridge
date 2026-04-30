@@ -283,6 +283,15 @@ pub fn wifi_connect_wps(
             let mut t = 0;
             loop {
                 if wifi.is_connected().unwrap() {
+                    crate::serial_display::show_system_message(
+                        "CONNECTED",
+                        &format!("{}\nConnection successful!", ssid)
+                    );
+                    
+                    // Wait for WPS internal processing to complete before changing power settings
+                    info!("[WPS] Waiting for connection stabilization...");
+                    thread::sleep(Duration::from_secs(3));
+                    
                     // Disable power management to prevent beacon timeout issues after WPS
                     unsafe {
                         let ret = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
@@ -293,11 +302,6 @@ pub fn wifi_connect_wps(
                         }
                     }
                     
-                    crate::serial_display::show_system_message(
-                        "CONNECTED",
-                        &format!("{}\nConnection successful!", ssid)
-                    );
-                    thread::sleep(Duration::from_secs(2));
                     // Clear system message to return to normal display
                     crate::serial_display::clear_system_message();
                     break;
