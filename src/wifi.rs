@@ -77,6 +77,15 @@ pub fn wifi_connect(
     let mut timeout = 0;
     loop {
         if wifi.is_connected().unwrap(){
+            // Disable power management to prevent beacon timeout issues
+            unsafe {
+                let ret = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
+                if ret == esp_idf_sys::ESP_OK as i32 {
+                    info!("[WiFi] Power management disabled (WIFI_PS_NONE)");
+                } else {
+                    info!("[WiFi] Warning: Failed to disable WiFi PM: 0x{:x}", ret);
+                }
+            }
             // info!("Wifi connected");
             break;
         }
@@ -274,6 +283,16 @@ pub fn wifi_connect_wps(
             let mut t = 0;
             loop {
                 if wifi.is_connected().unwrap() {
+                    // Disable power management to prevent beacon timeout issues after WPS
+                    unsafe {
+                        let ret = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
+                        if ret == esp_idf_sys::ESP_OK as i32 {
+                            info!("[WPS] WiFi power management disabled (WIFI_PS_NONE)");
+                        } else {
+                            info!("[WPS] Warning: Failed to disable WiFi PM: 0x{:x}", ret);
+                        }
+                    }
+                    
                     crate::serial_display::show_system_message(
                         "CONNECTED",
                         &format!("{}\nConnection successful!", ssid)
