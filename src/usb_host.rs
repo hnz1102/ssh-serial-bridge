@@ -1910,6 +1910,10 @@ unsafe fn uart_init(port_num: i32, tx_pin: i32, rx_pin: i32, baud_rate: u32) -> 
         log::warn!("[UART{}] uart_set_pin failed: {}", port_num, rc);
         return false;
     }
+    // Enable internal pull-up on TX and RX lines so they idle high when
+    // no external device is connected (prevents noise / framing errors).
+    gpio_pullup_en(tx_pin);
+    gpio_pullup_en(rx_pin);
     // RX buffer 8192 B, no TX buffer (direct write), no event queue
     let rc = uart_driver_install(port_num as u32, 8192, 0, 0, core::ptr::null_mut(), 0);
     if rc != 0 {
