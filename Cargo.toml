@@ -21,7 +21,7 @@ native = ["esp-idf-sys/native"]
 log = { version = "0.4", default-features = false }
 esp-idf-sys = { version = "0.36" }
 esp-idf-svc = { version = "0.51" }
-esp-idf-hal = "0.45.2"
+esp-idf-hal = "0.45"
 embedded-svc = "0.28"
 anyhow = "1"
 heapless = "0.8.0"
