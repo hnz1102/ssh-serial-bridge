@@ -160,6 +160,48 @@ pub fn get_rssi() -> i32 {
     }
 }
 
+/// Returns true when the STA is associated with an AP.
+pub fn is_sta_connected() -> bool {
+    unsafe {
+        let mut ap: esp_idf_sys::wifi_ap_record_t = core::mem::zeroed();
+        esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) == esp_idf_sys::ESP_OK as i32
+    }
+}
+
+/// Spawn a background thread that calls `esp_wifi_connect()` whenever the
+/// station is not associated with an AP.  The thread starts after an initial
+/// `start_delay_secs` grace period (let the first connection attempt settle),
+/// then checks every `interval_secs` seconds.
+///
+/// No reference to `EspWifi` is required — the credentials were already
+/// committed to the driver by `wifi_connect()`.
+pub fn start_wifi_monitor_thread(start_delay_secs: u64, interval_secs: u64) {
+    thread::Builder::new()
+        .name("wifi_mon".into())
+        .stack_size(4096)
+        .spawn(move || {
+            thread::sleep(Duration::from_secs(start_delay_secs));
+            loop {
+                if !is_sta_connected() {
+                    info!("[WiFi] Monitor: not connected — calling esp_wifi_connect()");
+                    unsafe {
+                        // Cancel any stale connection attempt first
+                        esp_idf_sys::esp_wifi_disconnect();
+                    }
+                    thread::sleep(Duration::from_millis(300));
+                    unsafe {
+                        let rc = esp_idf_sys::esp_wifi_connect();
+                        if rc != esp_idf_sys::ESP_OK as i32 {
+                            info!("[WiFi] Monitor: esp_wifi_connect() returned 0x{:x}", rc);
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_secs(interval_secs));
+            }
+        })
+        .expect("spawn wifi_mon");
+}
+
 /// Connect to Wi-Fi using WPS PBC (Push Button Configuration).
 ///
 /// Returns the connected `EspWifi` plus the SSID and passphrase obtained from

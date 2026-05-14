@@ -2,7 +2,6 @@ use log::info;
 use esp_idf_svc::hal::ledc::LedcDriver;
 use esp_idf_svc::hal::ledc::LedcTimerDriver;
 use esp_idf_svc::hal::ledc::config::TimerConfig;
-use esp_idf_svc::wifi::EspWifi;
 use esp_idf_svc::sntp::{EspSntp, SyncStatus, SntpConf, OperatingMode, SyncMode};
 use chrono::{DateTime, Utc};
 use esp_idf_hal::{gpio::*, prelude::*};
@@ -206,7 +205,7 @@ fn main() {
 
     // WiFi connect (using NVS config — falls back to cfg.toml if not set)
     // When wps_enable=true and SSID is empty, WPS PBC is used to obtain credentials.
-    let mut wifi_dev = if nvs_config.wps_enable == "true" && nvs_config.wifi_ssid.is_empty() {
+    let wifi_dev = if nvs_config.wps_enable == "true" && nvs_config.wifi_ssid.is_empty() {
         println!("WPS enabled and SSID not configured — starting WPS PBC (press WPS button on router)...");
         match wifi::wifi_connect_wps(peripherals.modem) {
             Ok((w, ssid, pass)) => {
@@ -230,37 +229,49 @@ fn main() {
     let dev_status = httpserver::StatusInfo::new();
     match &wifi_dev {
         Ok(w) => {
-            println!("WiFi connected.");
-            // Apply static IP if configured
+            // Apply static IP unconditionally (interface config, independent of connection state)
             if nvs_config.ip_mode == "static" {
                 match wifi::configure_static_ip(w, &nvs_config.ip_address, &nvs_config.subnet_mask, &nvs_config.gateway, &nvs_config.dns) {
-                    Ok(_) => println!("Static IP configured successfully"),
+                    Ok(_) => println!("Static IP configured"),
                     Err(e) => println!("Failed to set static IP: {:?}, falling back to DHCP", e),
                 }
             }
-            if let Ok(ip_info) = w.sta_netif().get_ip_info() {
-                println!("IP address: {}", ip_info.ip);
-                dev_status.set_wifi(
-                    &ip_info.ip.to_string(),
-                    &nvs_config.wifi_ssid,
-                    wifi::get_rssi(),
-                );
-                // Update mini display if enabled
+            if w.is_connected().unwrap_or(false) {
+                println!("WiFi connected.");
+                if let Ok(ip_info) = w.sta_netif().get_ip_info() {
+                    println!("IP address: {}", ip_info.ip);
+                    dev_status.set_wifi(
+                        &ip_info.ip.to_string(),
+                        &nvs_config.wifi_ssid,
+                        wifi::get_rssi(),
+                    );
+                    if nvs_config.mini_display_enable == "true" {
+                        let com1_baud = nvs_config.com1_baud.parse().unwrap_or(0);
+                        let rssi = wifi::get_rssi() as i8;
+                        mini_display::update_display_info(true, &ip_info.ip.to_string(), rssi, 0.0, com1_baud);
+                    }
+                }
+            } else {
+                println!("WiFi initialized (AP not reachable yet — will retry every 30 s).");
                 if nvs_config.mini_display_enable == "true" {
                     let com1_baud = nvs_config.com1_baud.parse().unwrap_or(0);
-                    let rssi = wifi::get_rssi() as i8;
-                    mini_display::update_display_info(true, &ip_info.ip.to_string(), rssi, 0.0, com1_baud);
+                    mini_display::update_display_info(false, "---", 0, 0.0, com1_baud);
                 }
             }
         },
         Err(e) => {
-            println!("WiFi connect failed: {:?}", e);
-            // Update mini display if enabled (show disconnected state)
+            println!("WiFi init failed: {:?}", e);
             if nvs_config.mini_display_enable == "true" {
                 let com1_baud = nvs_config.com1_baud.parse().unwrap_or(0);
                 mini_display::update_display_info(false, "---", 0, 0.0, com1_baud);
             }
         }
+    }
+
+    // Start WiFi monitor thread — reconnects every 30 s when not associated.
+    // Start after a 15 s grace period so the initial connect attempt can settle.
+    if wifi_dev.is_ok() {
+        wifi::start_wifi_monitor_thread(15, 30);
     }
 
     // Start HTTP config server (login protected, NVS-backed settings)
@@ -510,11 +521,8 @@ fn main() {
         }
 
         if !is_connected {
-            if count % 30 == 0 {
-                if let Ok(w) = wifi_dev.as_mut() {
-                    wifi_reconnect(w);
-                }
-            }
+            // Reconnection is handled by the wifi_monitor background thread.
+            // Nothing to do here except keep the status updated.
         } else {
             let rssi = wifi::get_rssi();
             dev_status.set_rssi(rssi);
@@ -531,12 +539,3 @@ fn main() {
     }
 }
 
-fn wifi_reconnect(wifi_dev: &mut EspWifi) -> bool{
-    unsafe {
-        esp_idf_sys::esp_wifi_start();
-    }
-    match wifi_dev.connect() {
-        Ok(_) => { info!("Wifi connecting requested."); true},
-        Err(ref e) => { info!("{:?}", e); false }
-    }
-}
