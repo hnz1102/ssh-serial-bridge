@@ -6,7 +6,6 @@
 
 use std::time::Duration;
 use std::thread;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use esp_idf_hal::peripheral;
@@ -21,31 +20,29 @@ use log::info;
 
 // ─── WPS state (shared between C event handler and Rust polling loop) ─────────
 
-/// WPS credentials received from the AP (SSID, passphrase).
-static WPS_CRED: Mutex<Option<(String, String)>> = Mutex::new(None);
+/// Set to true when WPS credentials are ready (esp_wifi_get_config will have them).
+static WPS_SUCCESS: AtomicBool = AtomicBool::new(false);
 /// Set to true when WPS fails or times out.
 static WPS_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Raw WPS event handler registered via esp_event_handler_register.
+///
+/// IMPORTANT: Do not dereference event_data for WIFI_EVENT_STA_WPS_ER_SUCCESS.
+/// ESP-IDF can post that event with event_data = NULL when the station is
+/// connected directly by the WPS state machine (ap_cred_cnt == 0 path).
+/// Reading credentials from event_data would crash with LoadProhibited.
+/// Instead we set a flag and let the polling loop read the credentials via
+/// esp_wifi_get_config(), which is always populated after WPS success.
 unsafe extern "C" fn wps_event_handler(
     _arg: *mut core::ffi::c_void,
     _base: esp_idf_sys::esp_event_base_t,
     event_id: i32,
-    event_data: *mut core::ffi::c_void,
+    _event_data: *mut core::ffi::c_void,
 ) {
     use esp_idf_sys::*;
     let id = event_id as u32;
     if id == wifi_event_t_WIFI_EVENT_STA_WPS_ER_SUCCESS {
-        let ev = &*(event_data as *const wifi_event_sta_wps_er_success_t);
-        let ssid_raw  = &ev.ap_cred[0].ssid;
-        let pass_raw  = &ev.ap_cred[0].passphrase;
-        let ssid_len  = ssid_raw.iter().position(|&b| b == 0).unwrap_or(ssid_raw.len());
-        let pass_len  = pass_raw.iter().position(|&b| b == 0).unwrap_or(pass_raw.len());
-        let ssid = String::from_utf8_lossy(&ssid_raw[..ssid_len]).into_owned();
-        let pass = String::from_utf8_lossy(&pass_raw[..pass_len]).into_owned();
-        if let Ok(mut c) = WPS_CRED.lock() {
-            *c = Some((ssid, pass));
-        }
+        WPS_SUCCESS.store(true, Ordering::Release);
     } else if id == wifi_event_t_WIFI_EVENT_STA_WPS_ER_FAILED
            || id == wifi_event_t_WIFI_EVENT_STA_WPS_ER_TIMEOUT {
         WPS_FAILED.store(true, Ordering::Release);
@@ -227,8 +224,8 @@ pub fn wifi_connect_wps(
     wifi.start().unwrap();
 
     // Reset static WPS state
+    WPS_SUCCESS.store(false, Ordering::Release);
     WPS_FAILED.store(false, Ordering::Release);
-    *WPS_CRED.lock().unwrap() = None;
 
     unsafe {
         // Register WPS event handler on the default system event loop
@@ -294,7 +291,25 @@ pub fn wifi_connect_wps(
             bail!("[WPS] WPS failed or timed out by AP at {}s", elapsed);
         }
 
-        if let Some((ssid, pass)) = WPS_CRED.lock().unwrap().clone() {
+        if WPS_SUCCESS.load(Ordering::Acquire) {
+            // Read credentials from the WiFi config — ESP-IDF writes them there
+            // during the WPS exchange regardless of whether event_data was null.
+            let (ssid, pass) = unsafe {
+                let mut cfg: esp_idf_sys::wifi_config_t = core::mem::zeroed();
+                esp_idf_sys::esp_wifi_get_config(
+                    esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+                    &mut cfg,
+                );
+                let sta = &cfg.sta;
+                let ssid_raw = &sta.ssid;
+                let pass_raw = &sta.password;
+                let ssid_len = ssid_raw.iter().position(|&b| b == 0).unwrap_or(ssid_raw.len());
+                let pass_len = pass_raw.iter().position(|&b| b == 0).unwrap_or(pass_raw.len());
+                (
+                    String::from_utf8_lossy(&ssid_raw[..ssid_len]).into_owned(),
+                    String::from_utf8_lossy(&pass_raw[..pass_len]).into_owned(),
+                )
+            };
             unsafe {
                 esp_idf_sys::esp_wifi_wps_disable();
                 // Unregister event handler
