@@ -20,28 +20,50 @@ use log::info;
 
 // ─── WPS state (shared between C event handler and Rust polling loop) ─────────
 
-/// Set to true when WPS credentials are ready (esp_wifi_get_config will have them).
+/// Set to true when WPS credentials are ready.
 static WPS_SUCCESS: AtomicBool = AtomicBool::new(false);
 /// Set to true when WPS fails or times out.
 static WPS_FAILED: AtomicBool = AtomicBool::new(false);
+/// Set to true when credentials were captured from event_data (ap_cred_cnt > 0 path).
+static WPS_GOT_CREDS: AtomicBool = AtomicBool::new(false);
+
+/// Statically allocated buffers for SSID / passphrase captured in the WPS event handler.
+/// Written exactly once (under WPS_GOT_CREDS Release fence) before any reader sees the flag.
+static mut WPS_SSID_BUF: [u8; 33] = [0u8; 33];
+static mut WPS_PASS_BUF: [u8; 65] = [0u8; 65];
 
 /// Raw WPS event handler registered via esp_event_handler_register.
 ///
-/// IMPORTANT: Do not dereference event_data for WIFI_EVENT_STA_WPS_ER_SUCCESS.
-/// ESP-IDF can post that event with event_data = NULL when the station is
-/// connected directly by the WPS state machine (ap_cred_cnt == 0 path).
-/// Reading credentials from event_data would crash with LoadProhibited.
-/// Instead we set a flag and let the polling loop read the credentials via
-/// esp_wifi_get_config(), which is always populated after WPS success.
+/// Two WPS-success paths in ESP-IDF:
+///   • ap_cred_cnt == 0 : driver connected internally, event_data may be NULL.
+///     Credentials end up in esp_wifi_get_config() — we read them in the poll loop.
+///   • ap_cred_cnt  > 0 : credentials are in event_data->ap_cred[].
+///     esp_wifi_get_config() may NOT contain the password yet at this point,
+///     so we copy them into WPS_SSID_BUF / WPS_PASS_BUF here.
 unsafe extern "C" fn wps_event_handler(
     _arg: *mut core::ffi::c_void,
     _base: esp_idf_sys::esp_event_base_t,
     event_id: i32,
-    _event_data: *mut core::ffi::c_void,
+    event_data: *mut core::ffi::c_void,
 ) {
     use esp_idf_sys::*;
     let id = event_id as u32;
     if id == wifi_event_t_WIFI_EVENT_STA_WPS_ER_SUCCESS {
+        if !event_data.is_null() {
+            let evt = &*(event_data as *const wifi_event_sta_wps_er_success_t);
+            if evt.ap_cred_cnt > 0 {
+                let ssid  = &evt.ap_cred[0].ssid;
+                let pass  = &evt.ap_cred[0].passphrase;
+                let slen  = ssid.iter().position(|&b| b == 0).unwrap_or(ssid.len());
+                let plen  = pass.iter().position(|&b| b == 0).unwrap_or(pass.len());
+                WPS_SSID_BUF[..slen].copy_from_slice(&ssid[..slen]);
+                WPS_SSID_BUF[slen] = 0;
+                WPS_PASS_BUF[..plen].copy_from_slice(&pass[..plen]);
+                WPS_PASS_BUF[plen] = 0;
+                // Release fence: readers see fully-written buffers after this store.
+                WPS_GOT_CREDS.store(true, Ordering::Release);
+            }
+        }
         WPS_SUCCESS.store(true, Ordering::Release);
     } else if id == wifi_event_t_WIFI_EVENT_STA_WPS_ER_FAILED
            || id == wifi_event_t_WIFI_EVENT_STA_WPS_ER_TIMEOUT {
@@ -226,6 +248,7 @@ pub fn wifi_connect_wps(
     // Reset static WPS state
     WPS_SUCCESS.store(false, Ordering::Release);
     WPS_FAILED.store(false, Ordering::Release);
+    WPS_GOT_CREDS.store(false, Ordering::Release);
 
     unsafe {
         // Register WPS event handler on the default system event loop
@@ -292,23 +315,36 @@ pub fn wifi_connect_wps(
         }
 
         if WPS_SUCCESS.load(Ordering::Acquire) {
-            // Read credentials from the WiFi config — ESP-IDF writes them there
-            // during the WPS exchange regardless of whether event_data was null.
-            let (ssid, pass) = unsafe {
-                let mut cfg: esp_idf_sys::wifi_config_t = core::mem::zeroed();
-                esp_idf_sys::esp_wifi_get_config(
-                    esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
-                    &mut cfg,
-                );
-                let sta = &cfg.sta;
-                let ssid_raw = &sta.ssid;
-                let pass_raw = &sta.password;
-                let ssid_len = ssid_raw.iter().position(|&b| b == 0).unwrap_or(ssid_raw.len());
-                let pass_len = pass_raw.iter().position(|&b| b == 0).unwrap_or(pass_raw.len());
-                (
-                    String::from_utf8_lossy(&ssid_raw[..ssid_len]).into_owned(),
-                    String::from_utf8_lossy(&pass_raw[..pass_len]).into_owned(),
-                )
+            // Read credentials:
+            //   • ap_cred_cnt > 0 path: captured from event_data in wps_event_handler.
+            //   • ap_cred_cnt == 0 path: driver connected internally; read from esp_wifi_get_config().
+            let (ssid, pass) = if WPS_GOT_CREDS.load(Ordering::Acquire) {
+                unsafe {
+                    let slen = WPS_SSID_BUF.iter().position(|&b| b == 0).unwrap_or(WPS_SSID_BUF.len());
+                    let plen = WPS_PASS_BUF.iter().position(|&b| b == 0).unwrap_or(WPS_PASS_BUF.len());
+                    (
+                        String::from_utf8_lossy(&WPS_SSID_BUF[..slen]).into_owned(),
+                        String::from_utf8_lossy(&WPS_PASS_BUF[..plen]).into_owned(),
+                    )
+                }
+            } else {
+                // ap_cred_cnt == 0: credentials were stored by the driver; read from config.
+                unsafe {
+                    let mut cfg: esp_idf_sys::wifi_config_t = core::mem::zeroed();
+                    esp_idf_sys::esp_wifi_get_config(
+                        esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+                        &mut cfg,
+                    );
+                    let sta = &cfg.sta;
+                    let ssid_raw = &sta.ssid;
+                    let pass_raw = &sta.password;
+                    let ssid_len = ssid_raw.iter().position(|&b| b == 0).unwrap_or(ssid_raw.len());
+                    let pass_len = pass_raw.iter().position(|&b| b == 0).unwrap_or(pass_raw.len());
+                    (
+                        String::from_utf8_lossy(&ssid_raw[..ssid_len]).into_owned(),
+                        String::from_utf8_lossy(&pass_raw[..pass_len]).into_owned(),
+                    )
+                }
             };
             unsafe {
                 esp_idf_sys::esp_wifi_wps_disable();
