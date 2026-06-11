@@ -207,7 +207,8 @@ fn main() {
     // When wps_enable=true and SSID is empty, WPS PBC is used to obtain credentials.
     let wifi_dev = if nvs_config.wps_enable == "true" && nvs_config.wifi_ssid.is_empty() {
         println!("WPS enabled and SSID not configured — starting WPS PBC (press WPS button on router)...");
-        match wifi::wifi_connect_wps(peripherals.modem) {
+        mini_display::show_message("WPS", "Connecting...\nPress WPS button\non router");
+        let result = match wifi::wifi_connect_wps(peripherals.modem) {
             Ok((w, ssid, pass)) => {
                 println!("WPS success: SSID={}", ssid);
                 httpserver::nvs_write_wifi_creds(&ssid, &pass);
@@ -219,7 +220,9 @@ fn main() {
                 println!("WPS failed: {:?}", e);
                 Err(e)
             }
-        }
+        };
+        mini_display::clear_message();
+        result
     } else {
         println!("Connecting to WiFi: {}", nvs_config.wifi_ssid);
         wifi::wifi_connect(peripherals.modem, &nvs_config.wifi_ssid, &nvs_config.wifi_psk)
