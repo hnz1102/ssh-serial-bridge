@@ -320,31 +320,30 @@ static void ssh_session_task(void *arg)
                 int wolf_err = wolfSSH_get_error(ssh);
 
                 if (rc == WS_CHAN_RXD && lastChannel == SHELL_CHANNEL_ID) {
-                    /* SSH client → device TX */
-                    int n = wolfSSH_ChannelIdRead(ssh, SHELL_CHANNEL_ID,
-                                                   buf, sizeof(buf));
-                    if (n > 0 && device_write_cb) {
-                        // { char tmp[96];
-                        //   snprintf(tmp, sizeof(tmp), "[DBG] SSH->DEV %d bytes [0x%02x] input_received=%d",
-                        //            n, buf[0], input_received);
-                        //   ssh_log_info(tmp); }
-                        device_write_cb(buf, (size_t)n);
-                        if (!input_received) {
-                            // ssh_log_info("[DBG] *** input_received = 1 ***");
-                            /* Discard any serial data queued before first input */
-                            uint8_t discard[256];
-                            size_t  disc_total = 0;
-                            size_t  dr;
-                            while ((dr = ring_read(discard, sizeof(discard))) > 0)
-                                disc_total += dr;
-                            // if (disc_total) {
-                            //     char tmp2[64];
-                            //     snprintf(tmp2, sizeof(tmp2), "[DBG] discarded %d ring bytes at first input", (int)disc_total);
-                            //     ssh_log_info(tmp2);
-                            // }
+                    /* SSH client → device TX.
+                     * Drain wolfSSH's internal channel buffer completely:
+                     * a single large paste may be buffered internally after
+                     * one wolfSSH_worker() call, but wolfSSH_ChannelIdRead()
+                     * returns at most sizeof(buf) bytes per call.  Without
+                     * this loop the remainder sits in the wolfSSH buffer until
+                     * the next WS_CHAN_RXD, so the device never receives the
+                     * full paste and the echo never comes back. */
+                    int n;
+                    while ((n = wolfSSH_ChannelIdRead(ssh, SHELL_CHANNEL_ID,
+                                                       buf, sizeof(buf))) > 0) {
+                        if (device_write_cb) {
+                            device_write_cb(buf, (size_t)n);
+                            if (!input_received) {
+                                /* Discard any serial data queued before first input */
+                                uint8_t discard[256];
+                                size_t  dr;
+                                while ((dr = ring_read(discard, sizeof(discard))) > 0)
+                                    (void)dr;
+                                input_received = 1; /* unlock serial→SSH forwarding */
+                            }
                         }
-                        input_received = 1; /* unlock serial→SSH forwarding */
-                    } else if (n < 0 && n != WS_WANT_READ) {
+                    }
+                    if (n < 0 && n != WS_WANT_READ) {
                         ESP_LOGI(TAG, "ChannelIdRead err %d", n);
                         break;
                     }
