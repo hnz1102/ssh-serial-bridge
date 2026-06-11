@@ -29,9 +29,9 @@ echo '      source "$HOME/.cargo/env"'
 echo ""
 
 echo "=== [3/6] Installing Cargo tools ==="
-cargo install ldproxy
-cargo install espup
-cargo install cargo-espflash
+cargo +stable install ldproxy
+cargo +stable install espup
+cargo +stable install cargo-espflash
 
 echo "=== [4/6] Installing ESP32-S3 toolchain via espup ==="
 espup install
