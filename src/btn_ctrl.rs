@@ -35,6 +35,7 @@ fn button_task(btn_pin: Gpio0, gpio_pwm_state: GpioPwmState) {
     let mut dcout_triggered = false;
     let mut factory_reset_triggered = false;
     let mut display_updated = false;
+    let mut mini_display_updated = false;
 
     loop {
         let btn_now = btn.is_high(); // high = released
@@ -50,7 +51,7 @@ fn button_task(btn_pin: Gpio0, gpio_pwm_state: GpioPwmState) {
             if let Some(start) = press_start {
                 let elapsed = start.elapsed().as_millis() as u64;
                 
-                // Show countdown after 6 seconds
+                // Show countdown after 6 seconds (serial display)
                 if elapsed >= 6000 && !display_updated {
                     let remaining = ((FACTORY_RESET_PRESS_MS - elapsed) / 1000) as i32;
                     if remaining > 0 {
@@ -69,6 +70,31 @@ fn button_task(btn_pin: Gpio0, gpio_pwm_state: GpioPwmState) {
                         crate::serial_display::show_system_message(
                             "FACTORY RESET",
                             &format!("Resetting to defaults\nin {} seconds...", remaining)
+                        );
+                    }
+                }
+                
+                // Show countdown on mini display after 5 seconds
+                if elapsed >= 5000 && !mini_display_updated {
+                    let remaining = ((FACTORY_RESET_PRESS_MS - elapsed) / 1000) as i32;
+                    if remaining > 0 {
+                        crate::mini_display::show_message(
+                            "FACTORY RESET",
+                            &format!("Reset in {}s...", remaining)
+                        );
+                        mini_display_updated = true;
+                    }
+                }
+                
+                // Update mini display countdown every second
+                if elapsed >= 5000 && elapsed < FACTORY_RESET_PRESS_MS
+                    && (elapsed / 1000) != ((elapsed - 50) / 1000)
+                {
+                    let remaining = ((FACTORY_RESET_PRESS_MS - elapsed) / 1000) as i32;
+                    if remaining > 0 {
+                        crate::mini_display::show_message(
+                            "FACTORY RESET",
+                            &format!("Reset in {}s...", remaining)
                         );
                     }
                 }
@@ -106,10 +132,14 @@ fn button_task(btn_pin: Gpio0, gpio_pwm_state: GpioPwmState) {
             if display_updated {
                 crate::serial_display::clear_system_message();
             }
+            if mini_display_updated {
+                crate::mini_display::clear_message();
+            }
             press_start = None;
             dcout_triggered = false;
             factory_reset_triggered = false;
             display_updated = false;
+            mini_display_updated = false;
         }
 
         btn_last = btn_now;
