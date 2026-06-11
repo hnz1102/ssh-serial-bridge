@@ -110,9 +110,26 @@ ssh-serial-bridge/
 
 ## Configuration
 
-### cfg.toml (build-time defaults)
+### Board-specific cfg.toml (build-time defaults)
 
-Copy `cfg.toml.tmp` to `cfg.toml` and fill in your values before building.
+Before building, choose a board config and copy it to `cfg.toml`.
+
+- `ssh-bridge-board`: Board with a 2.0-inch TFT display for serial data output
+- `mini-ssh-bridge-board`: Small-display board using SSD1306
+- `xiao-esp32s3`: XIAO ESP32S3 board
+
+```bash
+# 2.0-inch TFT display board
+cp cfg.toml.ssh-bridge-board cfg.toml
+
+# SSD1306 mini display board
+cp cfg.toml.mini-ssh-bridge-board cfg.toml
+
+# XIAO ESP32S3 board
+cp cfg.toml.xiao-esp32s3 cfg.toml
+```
+
+After copying, edit `cfg.toml` for your environment (Wi-Fi credentials, IP, etc.) if needed.
 
 ```toml
 [ssh-serial-bridge]
