@@ -55,6 +55,19 @@ static DISPLAY_INFO: Mutex<DisplayInfo> = Mutex::new(DisplayInfo {
     com1_baud: 0,
 });
 
+/// Overlay message (title, body) shown on top of normal content.
+static MINI_MESSAGE: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// Show an overlay message on the mini display.
+pub fn show_message(title: &str, text: &str) {
+    *MINI_MESSAGE.lock().unwrap() = Some((title.to_string(), text.to_string()));
+}
+
+/// Clear the overlay message and return to normal display.
+pub fn clear_message() {
+    *MINI_MESSAGE.lock().unwrap() = None;
+}
+
 /// Update all display information
 pub fn update_display_info(wifi_connected: bool, ip: &str, rssi: i8, dc_in_voltage: f32, com1_baud: u32) {
     let mut info = DISPLAY_INFO.lock().unwrap();
@@ -98,65 +111,86 @@ pub fn start_mini_display_thread(
             let line_style = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
             
             let mut last_info: Option<DisplayInfo> = None;
+            let mut last_message: Option<(String, String)> = None;
             
             loop {
-                // Get current display info
+                // Get current display info and overlay message
                 let info = DISPLAY_INFO.lock().unwrap().clone();
+                let msg  = MINI_MESSAGE.lock().unwrap().clone();
                 
-                // Only redraw if info has changed
-                if last_info.as_ref() != Some(&info) {
+                // Redraw if info or overlay message changed
+                if last_info.as_ref() != Some(&info) || last_message != msg {
                     // Clear display
                     display.clear(BinaryColor::Off).ok();
                     
-                    // Draw header line
-                    Line::new(Point::new(0, 12), Point::new(127, 12))
-                        .into_styled(line_style)
-                        .draw(&mut display)
-                        .ok();
-                    
-                    // Line 1: WiFi Status with RSSI (top)
-                    let wifi_status = if info.wifi_connected {
-                        format!("WiFi:{}dBm", info.rssi)
+                    if let Some((ref title, ref body)) = msg {
+                        // ── Overlay mode: show title + body ──────────────
+                        Text::new(title, Point::new(2, 10), text_style)
+                            .draw(&mut display)
+                            .ok();
+                        Line::new(Point::new(0, 14), Point::new(127, 14))
+                            .into_styled(line_style)
+                            .draw(&mut display)
+                            .ok();
+                        let mut y: i32 = 28;
+                        for line in body.split('\n') {
+                            Text::new(line, Point::new(2, y), small_style)
+                                .draw(&mut display)
+                                .ok();
+                            y += 12;
+                        }
                     } else {
-                        String::from("WiFi: --")
-                    };
-                    Text::new(&wifi_status, Point::new(2, 8), small_style)
-                        .draw(&mut display)
-                        .ok();
-                    
-                    // Line 2: IP Address
-                    let ip_text = format!("IP:{}", info.ip_address);
-                    Text::new(&ip_text, Point::new(2, 24), text_style)
-                        .draw(&mut display)
-                        .ok();
-                    
-                    // Line 3: DC IN Voltage
-                    let dc_text = format!("DC_IN:{:.2}V", info.dc_in_voltage);
-                    Text::new(&dc_text, Point::new(2, 40), text_style)
-                        .draw(&mut display)
-                        .ok();
-                    
-                    // Line 4: COM1 Baud Rate
-                    let baud_text = if info.com1_baud > 0 {
-                        format!("COM1:{}bps", info.com1_baud)
-                    } else {
-                        String::from("COM1:---")
-                    };
-                    Text::new(&baud_text, Point::new(2, 56), text_style)
-                        .draw(&mut display)
-                        .ok();
+                        // ── Normal mode ──────────────────────────────────
+                        // Draw header line
+                        Line::new(Point::new(0, 12), Point::new(127, 12))
+                            .into_styled(line_style)
+                            .draw(&mut display)
+                            .ok();
+                        
+                        // Line 1: WiFi Status with RSSI (top)
+                        let wifi_status = if info.wifi_connected {
+                            format!("WiFi:{}dBm", info.rssi)
+                        } else {
+                            String::from("WiFi: --")
+                        };
+                        Text::new(&wifi_status, Point::new(2, 8), small_style)
+                            .draw(&mut display)
+                            .ok();
+                        
+                        // Line 2: IP Address
+                        let ip_text = format!("IP:{}", info.ip_address);
+                        Text::new(&ip_text, Point::new(2, 24), text_style)
+                            .draw(&mut display)
+                            .ok();
+                        
+                        // Line 3: DC IN Voltage
+                        let dc_text = format!("DC_IN:{:.2}V", info.dc_in_voltage);
+                        Text::new(&dc_text, Point::new(2, 40), text_style)
+                            .draw(&mut display)
+                            .ok();
+                        
+                        // Line 4: COM1 Baud Rate
+                        let baud_text = if info.com1_baud > 0 {
+                            format!("COM1:{}bps", info.com1_baud)
+                        } else {
+                            String::from("COM1:---")
+                        };
+                        Text::new(&baud_text, Point::new(2, 56), text_style)
+                            .draw(&mut display)
+                            .ok();
+                    }
                     
                     // Flush to display
                     if let Err(e) = display.flush() {
                         info!("Failed to flush SSD1306: {:?}", e);
                     }
                     
-                    // Update last info
                     last_info = Some(info);
+                    last_message = msg;
                 }
                 
-                // Update every 1 second
-                thread::sleep(Duration::from_secs(1));
+                // Update every 250 ms for responsive overlay updates
+                thread::sleep(Duration::from_millis(250));
             }
         })
         .expect("Failed to spawn mini display thread");
