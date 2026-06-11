@@ -42,4 +42,4 @@ adc_conversion_factor = "74.47"
 cdc_retry_enable = "true"
 cdc_retry_interval = "5"  # seconds between retries (max 10 attempts)
 
-mini_display_enable = "false"
+mini_display_enable = "true"

@@ -26,7 +26,7 @@ com2_baud   = "115200"
 cdc_enable = "false"
 cdc_baud   = "115200"
 
-display_enable = "false"
+display_enable = "true"
 display_port   = "com1"    # "com1" / "com2" / "usb"
 
 pwm_enable = "true"
