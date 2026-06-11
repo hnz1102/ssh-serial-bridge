@@ -56,10 +56,13 @@ unsafe extern "C" fn wps_event_handler(
                 let pass  = &evt.ap_cred[0].passphrase;
                 let slen  = ssid.iter().position(|&b| b == 0).unwrap_or(ssid.len());
                 let plen  = pass.iter().position(|&b| b == 0).unwrap_or(pass.len());
-                WPS_SSID_BUF[..slen].copy_from_slice(&ssid[..slen]);
-                WPS_SSID_BUF[slen] = 0;
-                WPS_PASS_BUF[..plen].copy_from_slice(&pass[..plen]);
-                WPS_PASS_BUF[plen] = 0;
+                // Use raw pointers to avoid shared references to mutable statics.
+                let dst_s = core::ptr::addr_of_mut!(WPS_SSID_BUF) as *mut u8;
+                core::ptr::copy_nonoverlapping(ssid.as_ptr(), dst_s, slen);
+                dst_s.add(slen).write(0u8);
+                let dst_p = core::ptr::addr_of_mut!(WPS_PASS_BUF) as *mut u8;
+                core::ptr::copy_nonoverlapping(pass.as_ptr(), dst_p, plen);
+                dst_p.add(plen).write(0u8);
                 // Release fence: readers see fully-written buffers after this store.
                 WPS_GOT_CREDS.store(true, Ordering::Release);
             }
@@ -320,11 +323,22 @@ pub fn wifi_connect_wps(
             //   • ap_cred_cnt == 0 path: driver connected internally; read from esp_wifi_get_config().
             let (ssid, pass) = if WPS_GOT_CREDS.load(Ordering::Acquire) {
                 unsafe {
-                    let slen = WPS_SSID_BUF.iter().position(|&b| b == 0).unwrap_or(WPS_SSID_BUF.len());
-                    let plen = WPS_PASS_BUF.iter().position(|&b| b == 0).unwrap_or(WPS_PASS_BUF.len());
+                    // Copy into local buffers via raw pointers; no reference to static mut.
+                    let mut ssid_local = [0u8; 33];
+                    let mut pass_local = [0u8; 65];
+                    core::ptr::copy_nonoverlapping(
+                        core::ptr::addr_of!(WPS_SSID_BUF) as *const u8,
+                        ssid_local.as_mut_ptr(), 33,
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        core::ptr::addr_of!(WPS_PASS_BUF) as *const u8,
+                        pass_local.as_mut_ptr(), 65,
+                    );
+                    let slen = ssid_local.iter().position(|&b| b == 0).unwrap_or(33);
+                    let plen = pass_local.iter().position(|&b| b == 0).unwrap_or(65);
                     (
-                        String::from_utf8_lossy(&WPS_SSID_BUF[..slen]).into_owned(),
-                        String::from_utf8_lossy(&WPS_PASS_BUF[..plen]).into_owned(),
+                        String::from_utf8_lossy(&ssid_local[..slen]).into_owned(),
+                        String::from_utf8_lossy(&pass_local[..plen]).into_owned(),
                     )
                 }
             } else {
