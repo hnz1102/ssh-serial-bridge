@@ -382,7 +382,7 @@ extern "C" {
     fn ssh_bridge_init(port: u16,
                        username: *const core::ffi::c_char,
                        password: *const core::ffi::c_char) -> i32;
-    fn ssh_bridge_cdc_rx(data: *const u8, len: usize);
+    fn ssh_bridge_cdc_rx(device_id: u8, data: *const u8, len: usize);
 }
 
 // ─── C→Rust logging (so C logs appear in syslog) ─────────────────────────────
@@ -439,8 +439,42 @@ fn ftdi_port_count(pid: u16) -> usize {
     }
 }
 
-/// Which serial device is currently bridged to the active SSH session.
-static ACTIVE_DEVICE: AtomicU8 = AtomicU8::new(DEVICE_NONE);
+/// Per-device count of active SSH console sessions currently bridged,
+/// indexed by device-ID constant (index 0 = DEVICE_NONE, unused).
+/// Multiple sessions may share the same device concurrently (the C side
+/// fans received data out to every connected session's own ring buffer);
+/// RX data is forwarded here as long as the count is > 0.
+static ACTIVE_DEVICES: [AtomicU8; 7] = [
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0),
+];
+
+/// Map a device-ID constant to its canonical name string.
+fn device_name_for_id(id: u8) -> &'static str {
+    match id {
+        DEVICE_USB0 => "usb0",
+        DEVICE_USB1 => "usb1",
+        DEVICE_USB2 => "usb2",
+        DEVICE_USB3 => "usb3",
+        DEVICE_COM1 => "com1",
+        DEVICE_COM2 => "com2",
+        _           => "none",
+    }
+}
+
+/// Map a device name string (as used by `ssh_select_device`) back to its ID.
+fn device_id_for_name(name: &str) -> u8 {
+    match name {
+        "usb0" | "usb" => DEVICE_USB0,
+        "usb1"         => DEVICE_USB1,
+        "usb2"         => DEVICE_USB2,
+        "usb3"         => DEVICE_USB3,
+        "com1"         => DEVICE_COM1,
+        "com2"         => DEVICE_COM2,
+        _              => DEVICE_NONE,
+    }
+}
 
 /// Last device selection error reason (NUL-terminated C string in static storage).
 static LAST_SELECT_ERR: std::sync::Mutex<&'static [u8]> = std::sync::Mutex::new(b"Unknown device\0");
@@ -509,7 +543,7 @@ fn try_select_usb_port(port: usize) -> Option<extern "C" fn(*const u8, usize)> {
         return None;
     }
     let device_id = usb_port_device_id(port);
-    ACTIVE_DEVICE.store(device_id, Ordering::SeqCst);
+    ACTIVE_DEVICES[device_id as usize].fetch_add(1, Ordering::AcqRel);
     let cb: extern "C" fn(*const u8, usize) = match port {
         0 => usb0_write_cb,
         1 => usb1_write_cb,
@@ -536,25 +570,25 @@ pub extern "C" fn ssh_select_device(
         "usb2" => try_select_usb_port(2),
         "usb3" => try_select_usb_port(3),
         "com1" => {
-            if UART1_READY.load(Ordering::Relaxed) {
-                ACTIVE_DEVICE.store(DEVICE_COM1, Ordering::SeqCst);
-                log::info!("[SSH] device selected: com1 (UART1)");
-                Some(com1_write_cb)
-            } else {
+            if !UART1_READY.load(Ordering::Relaxed) {
                 log::warn!("[SSH] com1 requested but UART1 not initialised");
                 *LAST_SELECT_ERR.lock().unwrap() = b"com1 (UART1) not initialised\0";
                 None
+            } else {
+                ACTIVE_DEVICES[DEVICE_COM1 as usize].fetch_add(1, Ordering::AcqRel);
+                log::info!("[SSH] device selected: com1 (UART1)");
+                Some(com1_write_cb)
             }
         }
         "com2" => {
-            if UART2_READY.load(Ordering::Relaxed) {
-                ACTIVE_DEVICE.store(DEVICE_COM2, Ordering::SeqCst);
-                log::info!("[SSH] device selected: com2 (UART2)");
-                Some(com2_write_cb)
-            } else {
+            if !UART2_READY.load(Ordering::Relaxed) {
                 log::warn!("[SSH] com2 requested but UART2 not initialised");
                 *LAST_SELECT_ERR.lock().unwrap() = b"com2 (UART2) not initialised\0";
                 None
+            } else {
+                ACTIVE_DEVICES[DEVICE_COM2 as usize].fetch_add(1, Ordering::AcqRel);
+                log::info!("[SSH] device selected: com2 (UART2)");
+                Some(com2_write_cb)
             }
         }
         other => {
@@ -565,11 +599,19 @@ pub extern "C" fn ssh_select_device(
     }
 }
 
-/// Deactivate the current serial device when the SSH session ends.
+/// Deactivate one serial device session when its SSH console session ends.
+/// Decrements that device's active-session count (never below 0).
 #[no_mangle]
-pub extern "C" fn ssh_release_device(_name: *const core::ffi::c_char) {
-    ACTIVE_DEVICE.store(DEVICE_NONE, Ordering::SeqCst);
-    log::info!("[SSH] device released");
+pub extern "C" fn ssh_release_device(name: *const core::ffi::c_char) {
+    let name_str = unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_str()
+        .unwrap_or("");
+    let device_id = device_id_for_name(name_str);
+    if device_id != DEVICE_NONE {
+        let _ = ACTIVE_DEVICES[device_id as usize]
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1)));
+    }
+    log::info!("[SSH] device released: {}", name_str);
 }
 
 /// Set one GPIO output from SSH command.
@@ -836,8 +878,8 @@ unsafe extern "C" fn bulk_in_cb(transfer: *mut usb_transfer_t) {
             (data.as_ptr(), len)
         };
         // Forward received data to the SSH bridge (USB CDC → SSH)
-        if fwd_len > 0 && ACTIVE_DEVICE.load(Ordering::Relaxed) == device_id {
-            ssh_bridge_cdc_rx(fwd_ptr, fwd_len);
+        if fwd_len > 0 && ACTIVE_DEVICES[device_id as usize].load(Ordering::Relaxed) > 0 {
+            ssh_bridge_cdc_rx(device_id, fwd_ptr, fwd_len);
         }
         // Mirror to USB display buffer (always, regardless of display page)
         if fwd_len > 0 {
@@ -1926,8 +1968,9 @@ unsafe fn uart_init(port_num: i32, tx_pin: i32, rx_pin: i32, baud_rate: u32) -> 
 
 /// UART RX forwarding thread.
 ///
-/// Reads from `port_num` with a 10-tick timeout.  When `ACTIVE_DEVICE ==
-/// device_id`, the received bytes are forwarded to the SSH bridge ring buffer.
+/// Reads from `port_num` with a 10-tick timeout.  When this device's active
+/// flag is set (i.e. an SSH console session is bound to it), the received
+/// bytes are forwarded to that device's SSH bridge ring buffer.
 fn uart_rx_thread(port_num: i32, device_id: u8) {
     let mut buf = [0u8; 1024];
     loop {
@@ -1940,10 +1983,10 @@ fn uart_rx_thread(port_num: i32, device_id: u8) {
             )
         };
         if n > 0 {
-            // Forward to SSH bridge only when this is the active SSH device
-            if ACTIVE_DEVICE.load(Ordering::Relaxed) == device_id {
+            // Forward to SSH bridge only when this is an active SSH device
+            if ACTIVE_DEVICES[device_id as usize].load(Ordering::Relaxed) > 0 {
                 // log::info!("[RX] uart{} {} bytes", port_num, n);
-                unsafe { ssh_bridge_cdc_rx(buf.as_ptr(), n as usize); }
+                unsafe { ssh_bridge_cdc_rx(device_id, buf.as_ptr(), n as usize); }
             }
             // Mirror to per-port display buffer (always, regardless of page)
             let disp_lock = match device_id {
@@ -2003,17 +2046,15 @@ pub fn cdc_port_count() -> u8 {
     CDC_PORT_COUNT.load(Ordering::Relaxed)
 }
 
-/// Returns the name of the currently active bridged device.
-pub fn active_device_name() -> &'static str {
-    match ACTIVE_DEVICE.load(Ordering::Relaxed) {
-        DEVICE_USB0 => "usb0",
-        DEVICE_USB1 => "usb1",
-        DEVICE_USB2 => "usb2",
-        DEVICE_USB3 => "usb3",
-        DEVICE_COM1 => "com1",
-        DEVICE_COM2 => "com2",
-        _           => "none",
-    }
+/// Returns the name(s) of the currently active bridged device(s), comma-separated,
+/// or "none" if no SSH console session is bridged to any device.
+pub fn active_device_name() -> String {
+    let ids = [DEVICE_USB0, DEVICE_USB1, DEVICE_USB2, DEVICE_USB3, DEVICE_COM1, DEVICE_COM2];
+    let names: Vec<&str> = ids.iter()
+        .filter(|&&id| ACTIVE_DEVICES[id as usize].load(Ordering::Relaxed) > 0)
+        .map(|&id| device_name_for_id(id))
+        .collect();
+    if names.is_empty() { "none".to_string() } else { names.join(",") }
 }
 
 // ─── Public entry point ───────────────────────────────────────────────────────

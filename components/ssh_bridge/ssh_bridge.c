@@ -56,9 +56,18 @@
 
 #define TAG                 "SSH_BRIDGE"
 
+#ifndef SSH_BRIDGE_VERSION
+#define SSH_BRIDGE_VERSION  "0.1.1"
+#endif
+
 #ifndef SSH_BRIDGE_PASSWORD
 #define SSH_BRIDGE_PASSWORD "esp32"
 #endif
+
+/* Rust-side logging (goes through syslog); declared early so the device-slot
+ * helpers below (used from ssh_bridge_cdc_rx / session task) can call it. */
+extern void ssh_log_info(const char *msg);
+extern void ssh_log_warn(const char *msg);
 
 /* Ring buffer size for CDC → SSH direction.
  * Must be large enough to absorb bursts while the SSH channel window
@@ -75,42 +84,184 @@
 /* wolfSSH listener task stack size */
 #define SSH_LISTEN_STACK   (6 * 1024)
 
+/* Maximum simultaneous SSH sessions.  Each console session is bound to its
+ * own serial device (own ring buffer), so distinct devices can be bridged
+ * concurrently; only claiming the *same* device twice is rejected.
+ * Non-console commands (power/pwm/dcpower) are short-lived and also count
+ * against this limit while they run. */
+#define MAX_CONCURRENT_SESSIONS  6
+
 /* Shell channel ID (first channel opened is always 0) */
 #define SHELL_CHANNEL_ID   0
 
-/* ── CDC → SSH ring buffer ───────────────────────────────────────────────── */
+/* ── Per-device CDC/UART → SSH ring buffers ──────────────────────────────────
+ * Each serial device (usb0-3, com1, com2) can be bridged to up to
+ * MAX_SESSIONS_PER_DEVICE simultaneous SSH console sessions.  Each session
+ * gets its own ring buffer (allocated lazily from PSRAM when it connects,
+ * freed when it disconnects); incoming CDC/UART data is fanned out to every
+ * session's ring buffer so all connected clients see the same serial stream.
+ * SSH client → device writes from any session go straight to the shared
+ * write callback (no fan-out needed there — it's just one physical wire).
+ * Device IDs must match the Rust-side DEVICE_* constants. */
 
-static uint8_t          *s_ring      = NULL;   /* allocated from PSRAM */
-static volatile uint32_t s_ring_head = 0;
-static volatile uint32_t s_ring_tail = 0;
-static SemaphoreHandle_t s_ring_mutex = NULL;
+#define SSH_DEV_NONE  0
+#define SSH_DEV_USB0  1
+#define SSH_DEV_COM1  2
+#define SSH_DEV_COM2  3
+#define SSH_DEV_USB1  4
+#define SSH_DEV_USB2  5
+#define SSH_DEV_USB3  6
+#define NUM_DEVICE_SLOTS  7   /* index 0 (SSH_DEV_NONE) unused */
 
-/* Write bytes into the ring buffer (overflow = silently dropped) */
-static void ring_write(const uint8_t *data, size_t len)
+/* Max concurrent SSH console sessions sharing a single serial device. */
+#define MAX_SESSIONS_PER_DEVICE  4
+
+typedef struct {
+    uint8_t          *ring;       /* NULL when this session slot is free */
+    volatile uint32_t head;
+    volatile uint32_t tail;
+    volatile WOLFSSH  *owner_ssh; /* session bound to this ring (stale probe) */
+} ring_slot_t;
+
+typedef struct {
+    ring_slot_t rings[MAX_SESSIONS_PER_DEVICE];
+} device_slot_t;
+
+static device_slot_t    s_devices[NUM_DEVICE_SLOTS];
+static SemaphoreHandle_t s_devtable_mutex = NULL;
+
+/* Map a device name (as accepted by ssh_select_device) to its slot index. */
+static int device_id_from_name(const char *name)
 {
-    if (!s_ring_mutex || !s_ring) return;
-    xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
-    for (size_t i = 0; i < len; i++) {
-        uint32_t next = (s_ring_head + 1) % CDC_RING_SZ;
-        if (next != s_ring_tail) {
-            s_ring[s_ring_head] = data[i];
-            s_ring_head = next;
-        }
-    }
-    xSemaphoreGive(s_ring_mutex);
+    if (!name) return SSH_DEV_NONE;
+    if (strcmp(name, "usb") == 0 || strcmp(name, "usb0") == 0) return SSH_DEV_USB0;
+    if (strcmp(name, "usb1") == 0) return SSH_DEV_USB1;
+    if (strcmp(name, "usb2") == 0) return SSH_DEV_USB2;
+    if (strcmp(name, "usb3") == 0) return SSH_DEV_USB3;
+    if (strcmp(name, "com1") == 0) return SSH_DEV_COM1;
+    if (strcmp(name, "com2") == 0) return SSH_DEV_COM2;
+    return SSH_DEV_NONE;
 }
 
-/* Drain up to max_len bytes from the ring buffer.  Returns count read. */
-static size_t ring_read(uint8_t *buf, size_t max_len)
+/* Probe whether the wolfSSH session owning a slot has gone away without
+ * cleaning up (e.g. task crash).  Returns 1 if the underlying socket looks
+ * dead. */
+static int ssh_handle_is_dead(WOLFSSH *ssh)
 {
-    if (!s_ring_mutex || !s_ring) return 0;
-    xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
-    size_t n = 0;
-    while (s_ring_tail != s_ring_head && n < max_len) {
-        buf[n++] = s_ring[s_ring_tail];
-        s_ring_tail = (s_ring_tail + 1) % CDC_RING_SZ;
+    int fd = wolfSSH_get_fd(ssh);
+    int probe = fcntl(fd, F_GETFL);
+    if (probe < 0 && errno == EBADF) return 1;
+    char peek;
+    int r = recv(fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+    return (r == 0) || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+}
+
+/* Count how many sessions currently share device `idx`. */
+static int devtable_count(int idx)
+{
+    if (idx <= SSH_DEV_NONE || idx >= NUM_DEVICE_SLOTS) return 0;
+    int n = 0;
+    xSemaphoreTake(s_devtable_mutex, portMAX_DELAY);
+    for (int i = 0; i < MAX_SESSIONS_PER_DEVICE; i++) {
+        if (s_devices[idx].rings[i].ring != NULL) n++;
     }
-    xSemaphoreGive(s_ring_mutex);
+    xSemaphoreGive(s_devtable_mutex);
+    return n;
+}
+
+/* Claim a free ring-buffer slot for `name`, binding it to `ssh`.  Several
+ * sessions may share the same device concurrently (up to
+ * MAX_SESSIONS_PER_DEVICE).  Returns NULL if the device name is unknown, the
+ * device is already at capacity, or PSRAM allocation fails. */
+static ring_slot_t *devtable_acquire(const char *name, WOLFSSH *ssh)
+{
+    int idx = device_id_from_name(name);
+    if (idx == SSH_DEV_NONE) return NULL;
+
+    xSemaphoreTake(s_devtable_mutex, portMAX_DELAY);
+    device_slot_t *dev = &s_devices[idx];
+    ring_slot_t   *free_slot = NULL;
+    for (int i = 0; i < MAX_SESSIONS_PER_DEVICE; i++) {
+        ring_slot_t *r = &dev->rings[i];
+        if (r->ring != NULL && ssh_handle_is_dead((WOLFSSH *)r->owner_ssh)) {
+            ESP_LOGW(TAG, "Stale session on device %d slot %d — force-clearing", idx, i);
+            ssh_log_warn("Stale session on device — force-clearing");
+            heap_caps_free(r->ring);
+            r->ring      = NULL;
+            r->owner_ssh = NULL;
+        }
+        if (r->ring == NULL && free_slot == NULL) {
+            free_slot = r;
+        }
+    }
+    if (!free_slot) {
+        xSemaphoreGive(s_devtable_mutex);
+        return NULL;   /* device already has MAX_SESSIONS_PER_DEVICE sessions */
+    }
+    uint8_t *ring = (uint8_t *)heap_caps_malloc(CDC_RING_SZ, MALLOC_CAP_SPIRAM);
+    if (!ring) {
+        xSemaphoreGive(s_devtable_mutex);
+        ESP_LOGE(TAG, "PSRAM ring buffer alloc failed for device %d", idx);
+        return NULL;
+    }
+    free_slot->ring      = ring;
+    free_slot->head      = 0;
+    free_slot->tail      = 0;
+    free_slot->owner_ssh = ssh;
+    xSemaphoreGive(s_devtable_mutex);
+    return free_slot;
+}
+
+/* Release a session's ring-buffer slot. */
+static void devtable_release(ring_slot_t *slot)
+{
+    if (!slot) return;
+    xSemaphoreTake(s_devtable_mutex, portMAX_DELAY);
+    if (slot->ring) {
+        heap_caps_free(slot->ring);
+        slot->ring = NULL;
+    }
+    slot->owner_ssh = NULL;
+    xSemaphoreGive(s_devtable_mutex);
+}
+
+/* Internal: write into one ring buffer.  Caller must hold s_devtable_mutex. */
+static void ring_write_locked(ring_slot_t *slot, const uint8_t *data, size_t len)
+{
+    if (!slot->ring) return;
+    for (size_t i = 0; i < len; i++) {
+        uint32_t next = (slot->head + 1) % CDC_RING_SZ;
+        if (next != slot->tail) {
+            slot->ring[slot->head] = data[i];
+            slot->head = next;
+        }
+    }
+}
+
+/* Fan out received CDC/UART data to every session currently bridging this
+ * device, so all connected SSH clients see the same serial stream. */
+static void device_broadcast_write(int device_id, const uint8_t *data, size_t len)
+{
+    if (device_id <= SSH_DEV_NONE || device_id >= NUM_DEVICE_SLOTS) return;
+    device_slot_t *dev = &s_devices[device_id];
+    xSemaphoreTake(s_devtable_mutex, portMAX_DELAY);
+    for (int i = 0; i < MAX_SESSIONS_PER_DEVICE; i++) {
+        ring_write_locked(&dev->rings[i], data, len);
+    }
+    xSemaphoreGive(s_devtable_mutex);
+}
+
+/* Drain up to max_len bytes from one session's own ring buffer. */
+static size_t ring_read(ring_slot_t *slot, uint8_t *buf, size_t max_len)
+{
+    if (!slot || !slot->ring) return 0;
+    xSemaphoreTake(s_devtable_mutex, portMAX_DELAY);
+    size_t n = 0;
+    while (slot->tail != slot->head && n < max_len) {
+        buf[n++] = slot->ring[slot->tail];
+        slot->tail = (slot->tail + 1) % CDC_RING_SZ;
+    }
+    xSemaphoreGive(s_devtable_mutex);
     return n;
 }
 
@@ -119,9 +270,11 @@ static size_t ring_read(uint8_t *buf, size_t max_len)
 static uint16_t         s_port     = 22;
 static const char      *s_password = NULL;  /* set by ssh_bridge_init */
 
-/* One active session at a time; protected by mutex */
-static volatile WOLFSSH *s_active_ssh = NULL;
-static SemaphoreHandle_t s_ssh_mutex  = NULL;
+/* Session tracking; protected by s_ssh_mutex.
+ * s_session_count – total active sessions (console + power/pwm/dcpower).
+ * Per-device console ownership is tracked separately in s_devices[]. */
+static volatile int      s_session_count = 0;
+static SemaphoreHandle_t s_ssh_mutex     = NULL;
 
 /* wolfSSH context (shared across sessions) */
 static WOLFSSH_CTX *s_ctx = NULL;
@@ -152,9 +305,7 @@ static int ws_user_auth(byte authType,
     return WOLFSSH_USERAUTH_FAILURE;
 }
 
-/* ── Rust-side logging (goes through syslog) ─────────────────────────────── */
-extern void ssh_log_info(const char *msg);
-extern void ssh_log_warn(const char *msg);
+/* ── Rust-side logging/device callbacks (goes through syslog) ────────────── */
 extern void ssh_log_hex(const char *dir, const uint8_t *data, size_t len);
 extern const char *ssh_device_error(void);
 extern ssh_cdc_tx_cb_t ssh_select_device(const char *name);
@@ -171,6 +322,7 @@ static void ssh_session_task(void *arg)
     int             client_fd      = (int)(intptr_t)arg;
     char            device_name[32] = {0};     /* filled only for console sessions */
     ssh_cdc_tx_cb_t device_write_cb = NULL;
+    ring_slot_t    *devslot         = NULL;     /* this session's ring buffer, if console */
 
     /* Build wolfSSH session */
     ESP_LOGI(TAG, "heap: total=%u internal=%u psram=%u",
@@ -178,21 +330,18 @@ static void ssh_session_task(void *arg)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    xSemaphoreTake(s_ssh_mutex, portMAX_DELAY);
-
     WOLFSSH *ssh = wolfSSH_new(s_ctx);
     if (!ssh) {
         ESP_LOGE(TAG, "wolfSSH_new failed — internal free=%u",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        xSemaphoreTake(s_ssh_mutex, portMAX_DELAY);
+        s_session_count--;
         xSemaphoreGive(s_ssh_mutex);
         close(client_fd);
         vTaskDelete(NULL);
         return;
     }
     wolfSSH_set_fd(ssh, client_fd);
-    s_active_ssh = ssh;
-
-    xSemaphoreGive(s_ssh_mutex);
 
     ESP_LOGI(TAG, "heap after wolfSSH_new: total=%u internal=%u",
              (unsigned)esp_get_free_heap_size(),
@@ -231,6 +380,9 @@ static void ssh_session_task(void *arg)
         /* ssh -tt <host> console (usb|com1|com2) */
         snprintf(device_name, sizeof(device_name), "%s", a1[0] ? a1 : "usb");
 
+        /* Claim the device.  Several SSH sessions may bridge the same
+         * device concurrently (each gets its own ring buffer fed the same
+         * data), up to MAX_SESSIONS_PER_DEVICE. */
         device_write_cb = ssh_select_device(device_name);
         if (!device_write_cb) {
             const char *reason = ssh_device_error();
@@ -244,13 +396,36 @@ static void ssh_session_task(void *arg)
             goto cleanup;
         }
 
-        /* Welcome banner */
+        /* Allocate/claim a ring buffer slot for this session's CDC/UART → SSH data. */
+        devslot = devtable_acquire(device_name, ssh);
+        if (!devslot) {
+            char err[128];
+            snprintf(err, sizeof(err),
+                     "Error: too many sessions already connected to this device (max %d).\r\n",
+                     MAX_SESSIONS_PER_DEVICE);
+            wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
+                                   (const byte *)err, (word32)strlen(err));
+            ssh_release_device(device_name);
+            device_write_cb = NULL;
+            goto cleanup;
+        }
+
+        /* Welcome banner (notes other sessions already sharing this device) */
         {
-            char banner[256];
-            snprintf(banner, sizeof(banner),
-                     "\r\nConnected to ESP32-S3 serial bridge [%s].\r\n"
-                     "Disconnect: Enter then ~.\r\n\r\n",
-                     device_name);
+            int shared = devtable_count(device_id_from_name(device_name)) - 1;
+            char banner[320];
+            if (shared > 0) {
+                snprintf(banner, sizeof(banner),
+                         "\r\nConnected to ESP32-S3 SSH-Serial-Bridge v" SSH_BRIDGE_VERSION " [%s].\r\n"
+                         "Note: %d other session(s) are also connected to this device — input/output is shared.\r\n"
+                         "Disconnect: Enter then ~.\r\n\r\n",
+                         device_name, shared);
+            } else {
+                snprintf(banner, sizeof(banner),
+                         "\r\nConnected to ESP32-S3 SSH-Serial-Bridge v" SSH_BRIDGE_VERSION " [%s].\r\n"
+                         "Disconnect: Enter then ~.\r\n\r\n",
+                         device_name);
+            }
             wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
                                    (const byte *)banner, (word32)strlen(banner));
         }
@@ -261,7 +436,7 @@ static void ssh_session_task(void *arg)
             uint8_t tmp[256];
             size_t flushed = 0;
             size_t r;
-            while ((r = ring_read(tmp, sizeof(tmp))) > 0) flushed += r;
+            while ((r = ring_read(devslot, tmp, sizeof(tmp))) > 0) flushed += r;
             // char msg[64];
             // snprintf(msg, sizeof(msg), "[DBG] ring flushed %d bytes on connect", (int)flushed);
             // ssh_log_info(msg);
@@ -337,7 +512,7 @@ static void ssh_session_task(void *arg)
                                 /* Discard any serial data queued before first input */
                                 uint8_t discard[256];
                                 size_t  dr;
-                                while ((dr = ring_read(discard, sizeof(discard))) > 0)
+                                while ((dr = ring_read(devslot, discard, sizeof(discard))) > 0)
                                     (void)dr;
                                 input_received = 1; /* unlock serial→SSH forwarding */
                             }
@@ -388,7 +563,7 @@ static void ssh_session_task(void *arg)
                  * Discard silently until the SSH client has sent its first
                  * keystroke so the terminal is not flooded on connect. */
                 if (pend_len == 0) {
-                    size_t serial_n = ring_read(buf, sizeof(buf));
+                    size_t serial_n = ring_read(devslot, buf, sizeof(buf));
                     // if (serial_n > 0) {
                     //     char tmp[96];
                     //     snprintf(tmp, sizeof(tmp), "[DBG] ring_read %d bytes input_received=%d [0x%02x]",
@@ -503,7 +678,7 @@ static void ssh_session_task(void *arg)
     } else {
         /* No command or unknown command → show usage */
         const char *usage =
-            "\r\nESP32-S3 SSH-Serial-Bridge\r\n"
+            "\r\nESP32-S3 SSH-Serial-Bridge v" SSH_BRIDGE_VERSION "\r\n"
             "Usage:\r\n"
             "  ssh -tt admin@host console (usb|com1|com2)  -- Serial console bridge\r\n"
             "  ssh    admin@host power   (1-6) (on|off)    -- GPIO4-9 output control\r\n"
@@ -517,12 +692,15 @@ static void ssh_session_task(void *arg)
 
 cleanup:
     ESP_LOGI(TAG, "SSH session closed [%s]", device_name[0] ? device_name : "-");
+    if (devslot) {
+        devtable_release(devslot);
+    }
     if (device_write_cb) {
         ssh_release_device(device_name);
     }
     xSemaphoreTake(s_ssh_mutex, portMAX_DELAY);
-    s_active_ssh = NULL;
     wolfSSH_free(ssh);
+    s_session_count--;
     xSemaphoreGive(s_ssh_mutex);
 
     close(client_fd);
@@ -559,7 +737,7 @@ static void ssh_listen_task(void *arg)
         return;
     }
 
-    if (listen(listen_fd, 1) < 0) {
+    if (listen(listen_fd, MAX_CONCURRENT_SESSIONS) < 0) {
         ESP_LOGE(TAG, "listen() failed: %d", errno);
         close(listen_fd);
         vTaskDelete(NULL);
@@ -591,36 +769,16 @@ static void ssh_listen_task(void *arg)
             ssh_log_info(tmp);
         }
 
-        /* If a session is already active, check whether it is still alive.
-         * If the previous session task crashed/was killed without going through
-         * cleanup (e.g. panic, watchdog), s_active_ssh stays non-NULL and all
-         * subsequent connections would be permanently rejected.
-         * Guard the check with s_ssh_mutex to avoid a TOCTOU race. */
+        /* Check overall session limit.  Per-device staleness (a console task
+         * that crashed without releasing its device slot) is detected lazily
+         * in devtable_acquire() when the device is next claimed. */
         xSemaphoreTake(s_ssh_mutex, portMAX_DELAY);
-        if (s_active_ssh != NULL) {
-            int old_fd = wolfSSH_get_fd(s_active_ssh);
-            /* Probe whether the underlying socket is still open */
-            int probe = fcntl(old_fd, F_GETFL);
-            int dead = (probe < 0 && errno == EBADF);
-            if (!dead) {
-                /* Try a one-byte peek-recv to detect a remotely-closed socket */
-                char peek;
-                int r = recv(old_fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
-                dead = (r == 0) || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
-            }
-            if (dead) {
-                ESP_LOGW(TAG, "Stale session detected (fd=%d dead) — force-clearing", old_fd);
-                ssh_log_warn("Stale session detected — force-clearing s_active_ssh");
-                wolfSSH_free((WOLFSSH *)s_active_ssh);
-                s_active_ssh = NULL;
-            }
-        }
-        int busy = (s_active_ssh != NULL);
+        int full = (s_session_count >= MAX_CONCURRENT_SESSIONS);
         xSemaphoreGive(s_ssh_mutex);
 
-        if (busy) {
-            ESP_LOGW(TAG, "Already have an active session — rejecting");
-            ssh_log_warn("Rejecting: session already active");
+        if (full) {
+            ESP_LOGW(TAG, "Max sessions (%d) reached — rejecting", MAX_CONCURRENT_SESSIONS);
+            ssh_log_warn("Rejecting: max concurrent sessions reached");
             close(client_fd);
             continue;
         }
@@ -648,18 +806,19 @@ static void ssh_listen_task(void *arg)
             ESP_LOGE(TAG, "xTaskCreate(ssh_session) failed");
             ssh_log_warn("xTaskCreate(ssh_session) FAILED — not enough memory?");
             close(client_fd);
+        } else {
+            xSemaphoreTake(s_ssh_mutex, portMAX_DELAY);
+            s_session_count++;
+            xSemaphoreGive(s_ssh_mutex);
         }
     }
 }
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-void ssh_bridge_cdc_rx(const uint8_t *data, size_t len)
+void ssh_bridge_cdc_rx(uint8_t device_id, const uint8_t *data, size_t len)
 {
-    // char tmp[96];
-    // snprintf(tmp, sizeof(tmp), "[DBG] cdc_rx len=%d head=%lu tail=%lu", (int)len, (unsigned long)s_ring_head, (unsigned long)s_ring_tail);
-    // ssh_log_info(tmp);
-    ring_write(data, len);
+    device_broadcast_write((int)device_id, data, len);
 }
 
 int ssh_bridge_init(uint16_t port,
@@ -670,20 +829,15 @@ int ssh_bridge_init(uint16_t port,
 
     ESP_LOGI(TAG, "SSH bridge: user='%s'", username ? username : "(any)");
     /* Create synchronisation primitives */
-    s_ring_mutex = xSemaphoreCreateMutex();
-    s_ssh_mutex  = xSemaphoreCreateMutex();
-    if (!s_ring_mutex || !s_ssh_mutex) {
+    s_devtable_mutex = xSemaphoreCreateMutex();
+    s_ssh_mutex      = xSemaphoreCreateMutex();
+    if (!s_devtable_mutex || !s_ssh_mutex) {
         ESP_LOGE(TAG, "Mutex creation failed");
         return -1;
     }
 
-    /* Allocate ring buffer from PSRAM (too large for internal SRAM) */
-    s_ring = (uint8_t *)heap_caps_malloc(CDC_RING_SZ, MALLOC_CAP_SPIRAM);
-    if (!s_ring) {
-        ESP_LOGE(TAG, "PSRAM ring buffer alloc failed (%d bytes)", CDC_RING_SZ);
-        return -1;
-    }
-    ESP_LOGI(TAG, "CDC ring buffer: %d KB (PSRAM)", CDC_RING_SZ / 1024);
+    /* Per-device ring buffers are allocated lazily from PSRAM when a console
+     * session claims that device (see devtable_acquire()). */
 
     /* Route wolfSSL/wolfCrypt heap allocations through stdlib malloc so that
      * ESP-IDF's SPIRAM_USE_MALLOC fallback is active.  By default wolfSSL
@@ -706,7 +860,7 @@ int ssh_bridge_init(uint16_t port,
     }
 
     wolfSSH_SetUserAuth(s_ctx, ws_user_auth);
-    wolfSSH_CTX_SetBanner(s_ctx, "ESP32-S3 SSH-Serial-Bridge\r\n");
+    wolfSSH_CTX_SetBanner(s_ctx, "ESP32-S3 SSH-Serial-Bridge v" SSH_BRIDGE_VERSION "\r\n");
 
     /* Load embedded ECC-256 host key (much less heap than RSA 2048 during handshake) */
     int rc = wolfSSH_CTX_UsePrivateKey_buffer(

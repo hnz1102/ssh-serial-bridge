@@ -14,6 +14,10 @@ use esp_idf_sys::*;
 use std::ffi::CString;
 use crate::gpio_ctrl::GpioPwmState;
 
+// ─── App version ─────────────────────────────────────────────────────────────
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ─── NVS namespace ────────────────────────────────────────────────────────────
 
 const NVS_NS: &str = "usbotg_cfg";
@@ -505,7 +509,7 @@ h1{{color:#f87171;text-align:center;font-size:1.4em;padding:18px 0 14px;letter-s
 hr{{border:none;border-top:1px solid #1e3a5f;margin:10px 0}}
 </style></head><body>
 <div class="page">
-<h1>&#x1F5A7; SSH-Serial-Bridge Config</h1>
+<h1>&#x1F5A7; SSH-Serial-Bridge Config <span style="font-size:.6em;color:#94a3b8">v{version}</span></h1>
 <div id="msg"></div>
 
 <!-- Status -->
@@ -764,7 +768,8 @@ function updateStatus() {{
       '<span class="stat-key">Chip Temp</span><span class="stat-val"><span class="badge ' + (d.chip_temp < 70 ? 'badge-ok' : d.chip_temp < 85 ? 'badge-warn' : 'badge-err') + '">' + d.chip_temp.toFixed(1) + ' °C</span></span>' +
       '<span class="stat-key">USB CDC</span><span class="stat-val">' + usb + '</span>' +
       '<span class="stat-key">Active Device</span><span class="stat-val">' + dev + '</span>' +
-      '<span class="stat-key">Display Port</span><span class="stat-val"><span class="badge badge-ok">' + d.display_port + '</span></span>';
+      '<span class="stat-key">Display Port</span><span class="stat-val"><span class="badge badge-ok">' + d.display_port + '</span></span>' +
+      '<span class="stat-key">Version</span><span class="stat-val"><span class="badge badge-ok">v' + d.version + '</span></span>';
   }})
   .catch(() => {{}});
 }}
@@ -854,6 +859,7 @@ document.getElementById('boot-log-overlay').addEventListener('click', function(e
         ntp_server2   = esc(&cfg.ntp_server2),
         ntp_server3   = esc(&cfg.ntp_server3),
         ntp_server4   = esc(&cfg.ntp_server4),
+        version       = APP_VERSION,
     )
 }
 
@@ -1163,7 +1169,7 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
         let chip_name    = crate::usb_host::cdc_device_chip_name();
         let usb_ports    = crate::usb_host::cdc_port_count();
         let json = format!(
-            r#"{{"ip":"{ip}","ssid":"{ssid}","rssi":{rssi},"dc_in_voltage":{dc_in:.2},"dc_out_voltage":{dc_out:.2},"chip_temp":{chip_temp:.1},"cdc_enabled":{cdc_enabled},"usb_connected":{usb_connected},"usb_vid":"0x{vid:04X}","usb_pid":"0x{pid:04X}","usb_device":"{chip_name}","usb_ports":{usb_ports},"active_device":"{active_dev}","display_port":"{display_port}"}}"#,
+            r#"{{"ip":"{ip}","ssid":"{ssid}","rssi":{rssi},"dc_in_voltage":{dc_in:.2},"dc_out_voltage":{dc_out:.2},"chip_temp":{chip_temp:.1},"cdc_enabled":{cdc_enabled},"usb_connected":{usb_connected},"usb_vid":"0x{vid:04X}","usb_pid":"0x{pid:04X}","usb_device":"{chip_name}","usb_ports":{usb_ports},"active_device":"{active_dev}","display_port":"{display_port}","version":"{version}"}}"#,
             ip          = esc(&ip),
             ssid        = esc(&ssid),
             rssi        = rssi,
@@ -1178,6 +1184,7 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
             usb_ports   = usb_ports,
             active_dev  = active_dev,
             display_port = crate::usb_host::display_port_name(),
+            version      = APP_VERSION,
         );
         let headers = [("Content-Type", "application/json")];
         request.into_response(200, Some("OK"), &headers)?

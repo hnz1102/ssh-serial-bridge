@@ -43,16 +43,21 @@ int ssh_bridge_init(uint16_t port,
                     const char *username, const char *password);
 
 /**
- * Feed data received from the USB CDC device (USB bulk-IN) into the SSH
- * bridge.  The data is buffered and sent to any currently connected SSH
- * client as terminal output.
+ * Feed data received from a serial device (USB CDC bulk-IN or UART RX) into
+ * the SSH bridge.  The data is fanned out into the ring buffer of every SSH
+ * session currently bridging that device, so all clients connected to the
+ * same device see the same serial stream (multiple concurrent sessions per
+ * device are supported, up to MAX_SESSIONS_PER_DEVICE).
  *
  * Safe to call from an interrupt or any FreeRTOS task.
  *
- * @param data  received bytes
- * @param len   number of bytes
+ * @param device_id  device identifier (must match the ID scheme used by the
+ *                    Rust-side DEVICE_* constants: 1=usb0, 2=com1, 3=com2,
+ *                    4=usb1, 5=usb2, 6=usb3)
+ * @param data       received bytes
+ * @param len        number of bytes
  */
-void ssh_bridge_cdc_rx(const uint8_t *data, size_t len);
+void ssh_bridge_cdc_rx(uint8_t device_id, const uint8_t *data, size_t len);
 
 #ifdef __cplusplus
 }
