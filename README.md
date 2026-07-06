@@ -8,7 +8,7 @@ C component (wolfSSH) for the SSH server.
 
 | Feature | Description |
 |---------|-------------|
-| SSH server | Port 22, username/password authentication via wolfSSH, one session at a time |
+| SSH server | Port 22, username/password authentication via wolfSSH, multiple concurrent sessions (including shared sessions on the same serial port) |
 | Serial ports | COM1 / COM2 (UART) and USB CDC (USB Host) — up to 4 ports (`usb0`–`usb3`) |
 | Web UI | Browser-based configuration, terminal, and GPIO control |
 | WebSocket terminal | Built-in xterm.js; access serial data from the browser at `/terminal` |
@@ -426,7 +426,8 @@ Flash: 8 MB, DIO mode, 40 MHz.
 | Auth method | Password only (public-key authentication is not supported) |
 | Username | Any string is accepted — only the password is checked |
 | Password | Set via `ssh_password` in `cfg.toml` or Web UI (default: `esp32`) |
-| Concurrent sessions | 1 (a second connection is rejected while a session is active) |
+| Concurrent sessions | Up to 6 total SSH sessions (including command sessions) |
+| Per-device console sharing | Up to 4 concurrent console sessions on the same target (`usb0`-`usb3`, `com1`, `com2`) |
 
 > **Security note:** Change the default password before deploying the device
 > on a shared network.
@@ -459,8 +460,24 @@ ssh -tt <user>@<device_ip> console (usb0|usb1|usb2|usb3|com1|com2)
   terminal behaviour.
 - A welcome banner is printed on connect:
   ```
-  Connected to ESP32-S3 serial bridge [com1].
+  Connected to ESP32-S3 SSH-Serial-Bridge v0.1.1 [com1].
   Disconnect: Enter then ~.
+  ```
+- The same serial target can be shared by multiple SSH clients.  When another
+  session is already connected to that target, the banner also shows:
+  ```
+  Note: N other session(s) are also connected to this device — input/output is shared.
+  ```
+- Shared-session behaviour on the same target:
+  - RX from device is broadcast to all connected SSH sessions on that target.
+  - TX from each SSH session is sent to the same physical serial line, so input
+    from multiple users can interleave.
+- Capacity limits:
+  - Max 4 console sessions per target (`com1`, `com2`, `usb0`-`usb3`).
+  - Max 6 total SSH sessions across the system.
+- If a target already has 4 console sessions, new attempts are rejected with:
+  ```
+  Error: too many sessions already connected to this device (max 4).
   ```
 - Serial data received before the first keystroke from the SSH client is
   discarded to prevent stale output flooding the terminal on login.
@@ -554,7 +571,7 @@ ssh admin@192.168.2.200 pwm 1 100   # GPIO10 → full on
 ```
 ESP32-S3 SSH-Serial-Bridge
 Usage:
-  ssh -tt admin@host console (usb|com1|com2)  -- Serial console bridge
+  ssh -tt admin@host console (usb0|usb1|usb2|usb3|com1|com2)  -- Serial console bridge
   ssh    admin@host power   (1-6) (on|off)    -- GPIO4-9 output control
   ssh    admin@host dcpower (on|off)          -- DC Power output (GPIO12)
   ssh    admin@host pwm   (1|2) (0-100)       -- PWM GPIO10-11 duty %
@@ -653,8 +670,8 @@ in channel order:
 
 | Component / Library | Version | License | Purpose |
 |---------------------|---------|---------|---------|
-| **ssh-serial-bridge** (this project) | 0.1.0 | MIT | Firmware (Rust) |
-| **ssh_bridge** component | 0.1.0 | MIT | SSH server C wrapper |
+| **ssh-serial-bridge** (this project) | 0.1.1 | MIT | Firmware (Rust) |
+| **ssh_bridge** component | 0.1.1 | MIT | SSH server C wrapper |
 | esp-idf-hal | 0.45.2 | MIT / Apache-2.0 | ESP32-S3 hardware abstraction |
 | esp-idf-svc | 0.51 | MIT / Apache-2.0 | Wi-Fi, HTTP server, SNTP, etc. |
 | **wolfSSH** | commit `157cb01f` | GPLv3 (or commercial) | SSH server protocol |
