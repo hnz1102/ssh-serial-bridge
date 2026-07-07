@@ -1,4 +1,12 @@
-# ssh-serial-bridge
+<div align="center">
+  <h1><code>SSH Serial Bridge</code></h1>
+  <p>
+    <img src="doc/ssh-serial-bridge.jpg"/>
+    <img src="doc/mini-ssh-serial-bridge.jpg"/>
+  </p>
+</div>
+
+# ssh-serial-bridge - SSH-to-Serial Bridge for Raspberry Pi, USB CDC and UART
 
 Firmware for the ESP32-S3 that bridges an SSH connection (over Wi-Fi) to UART
 and USB CDC serial ports.  Written in Rust (esp-idf-hal / esp-idf-svc) with a
@@ -26,7 +34,7 @@ C component (wolfSSH) for the SSH server.
 ```
 SSH client ──[TCP:22]──► ssh_bridge.c (wolfSSH)
                                │
-                         ring buffer (PSRAM 128 KB)
+        per-session ring buffers (PSRAM)
                                │
 Rust usb_host.rs ◄─────────────┘
  ├── COM1 (UART1)
@@ -61,9 +69,10 @@ ssh-serial-bridge/
 │   └── wolfssl/          # wolfSSL/wolfCrypt (github.com/wolfSSL/wolfssl, commit b7e7e755)
 ├── static/               # Embedded static files (xterm.js / css / fit addon)
 ├── cfg.toml              # Build-time default configuration (gitignored — contains credentials)
-├── cfg.toml.tmp          # Template for cfg.toml (safe to commit)
+├── cfg.toml.<board>      # Board-specific templates (e.g. ssh-bridge-board / xiao-esp32s3)
 ├── sdkconfig.defaults    # ESP-IDF build settings
 ├── partitions.csv        # Flash partition table
+├── build-flash-images.sh # Build merged flash + app-only OTA images per board
 ├── setup_components.sh   # Initial setup script for components/
 └── setup_env.sh          # One-shot environment setup (Rust, espup, udev)
 ```
@@ -347,13 +356,26 @@ espflash flash --release --monitor
 
 ### Creating a complete flash binary image
 
-To create a single binary file that includes all partitions (bootloader, partition table, nvs, phy_init, and factory app) for distribution or web-based flashing:
+To create a single binary file that includes all partitions (bootloader,
+partition table, data partitions, and the currently built app image) for
+distribution or web-based flashing:
 
 ```bash
 cargo espflash save-image --release --merge --chip esp32s3 complete_flash.bin
 ```
 
 This creates a complete 8 MB flash image starting from offset 0x0.
+
+### Creating board images for both USB flashing and OTA
+
+The helper script builds all board configs and produces both image types:
+
+- `flash_images/flash_<board>.bin` (merged full-flash image, write at `0x0`)
+- `flash_images/app_<board>.bin` (app-only image for `ssh ... update` OTA)
+
+```bash
+bash build-flash-images.sh
+```
 
 **Important**: When flashing this image, always write it to **offset 0x0**, not 0x9000. Writing to 0x9000 will result in a boot failure with "invalid header: 0xffffffff" error.
 
@@ -388,8 +410,10 @@ This method is ideal for:
 | Partition     | Offset  | Size   |
 |---------------|---------|--------|
 | nvs           | 0x9000  | 24 KB  |
-| phy_init      | 0xF000  | 4 KB   |
-| factory (app) | 0x10000 | 7.9 MB |
+| otadata       | 0xF000  | 8 KB   |
+| phy_init      | 0x11000 | 4 KB   |
+| ota_0 (app)   | 0x20000 | 4032 KB |
+| ota_1 (app)   | 0x410000 | 4032 KB |
 
 Flash: 8 MB, DIO mode, 40 MHz.
 
