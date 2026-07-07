@@ -421,6 +421,14 @@ Flash: 8 MB, DIO mode, 40 MHz.
 
 ## Web UI Endpoints
 
+### Web UI Snapshots
+
+<div align="center">
+  <img src="doc/main.png" alt="Web UI main configuration page" width="32%"/>
+  <img src="doc/terminal.png" alt="Web UI terminal page" width="32%"/>
+  <img src="doc/gpio.png" alt="Web UI GPIO control page" width="32%"/>
+</div>
+
 | URL | Method | Description |
 |-----|--------|-------------|
 | `/login` | GET / POST | Login |
