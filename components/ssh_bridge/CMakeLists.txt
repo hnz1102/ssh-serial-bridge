@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.16)
 idf_component_register(
     SRCS         "ssh_bridge.c"
     INCLUDE_DIRS "include"
-    REQUIRES     wolfssl wolfssh lwip freertos
+    REQUIRES     wolfssl wolfssh lwip freertos app_update
 )
 
 # wolfSSL's settings.h uses #include "FreeRTOS.h".

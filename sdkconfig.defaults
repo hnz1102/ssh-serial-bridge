@@ -22,4 +22,16 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=n
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 #CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+# NOTE: esp-idf-sys builds from a synthetic out-of-tree CMake project, so
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME is NOT resolved relative to this
+# repo — it must be an absolute path. Update this if the repo is moved.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="/home/nodeadmin/esp32/esp32-s3/ssh-serial-bridge/partitions.csv"
+
+# OTA firmware update support (see components/ssh_bridge "update" command).
+# Two OTA app slots (ota_0/ota_1) + otadata, defined in partitions.csv.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# partitions.csv spans the full 8MB flash (matches espflash.toml).
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"

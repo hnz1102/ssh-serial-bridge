@@ -37,6 +37,8 @@
 /* ESP-IDF */
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
+#include <esp_ota_ops.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -317,6 +319,122 @@ extern void ssh_release_device(const char *name);
 extern int ssh_gpio_set(int idx, int on_off);
 extern int ssh_pwm_set(int ch, int duty);
 
+/* Gracefully close the SSH session (exit-status + channel EOF/close, then
+ * flush and shut down the TCP connection) before rebooting the device, so
+ * the client sees a clean session/connection close instead of the TCP
+ * connection just vanishing when the reset happens. Call this right before
+ * esp_restart() from any command that reboots the device. */
+static void ssh_close_before_reboot(WOLFSSH *ssh, int client_fd)
+{
+    wolfSSH_stream_exit(ssh, 0);
+
+    /* Pump the (non-blocking) socket briefly so the exit-status/EOF/close
+     * packets queued above actually reach the client instead of sitting in
+     * wolfSSH's internal output buffer. */
+    int flags = fcntl(client_fd, F_GETFL, 0);
+    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+    for (int i = 0; i < 30; i++) {
+        word32 lastChannel = 0;
+        int rc = wolfSSH_worker(ssh, &lastChannel);
+        if (rc != WS_SUCCESS && rc != WS_WANT_READ &&
+            rc != WS_WANT_WRITE && rc != WS_CHAN_RXD) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    wolfSSH_free(ssh);
+    shutdown(client_fd, SHUT_RDWR);
+    close(client_fd);
+
+    /* Give the client's SSH/TCP stack time to observe the channel close and
+     * FIN before the device actually resets. */
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+/* ── OTA update helper task ───────────────────────────────────────────────
+ * esp_ota_begin()/esp_ota_write()/esp_ota_end() briefly disable both CPU
+ * caches while touching flash, which requires the *calling task's own
+ * stack* to live in internal RAM — ssh_session_task's stack is deliberately
+ * allocated in PSRAM (see MALLOC_CAP_SPIRAM below), so calling esp_ota_*
+ * directly from it crashes with
+ * "assert failed: ... esp_task_stack_is_sane_cache_disabled()".
+ * The actual flash writes are therefore off-loaded to this small dedicated
+ * task (internal-RAM stack), fed one chunk at a time through a semaphore
+ * handoff from ssh_session_task. The chunk data itself is also bounce-
+ * copied into an internal static buffer before esp_ota_write(), since the
+ * source buffer must likewise be reachable while caches are disabled. */
+#define OTA_WORKER_STACK  (8 * 1024)
+
+typedef struct {
+    SemaphoreHandle_t       ready;      /* producer -> worker: chunk (or EOF) ready */
+    SemaphoreHandle_t       done;       /* worker -> producer: chunk processed */
+    const uint8_t          *data;       /* chunk pointer (may be in PSRAM); ignored if eof */
+    size_t                  len;
+    int                     eof;        /* 1 = no more data, finalise the update */
+    esp_err_t               err;        /* result of the last operation */
+    const esp_partition_t  *partition;  /* set once esp_ota_get_next_update_partition() succeeds */
+} ota_worker_ctx_t;
+
+static void ota_worker_task(void *arg)
+{
+    ota_worker_ctx_t *ctx = (ota_worker_ctx_t *)arg;
+    /* Internal-RAM bounce buffer (matches the SSH read chunk size below). */
+    static uint8_t s_ota_bounce[1024];
+    esp_ota_handle_t handle = 0;
+    esp_err_t err;
+    int failed = 0;
+
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    ctx->partition = part;
+    if (!part) {
+        ctx->err = ESP_ERR_NOT_FOUND;
+        xSemaphoreGive(ctx->done);
+        vTaskSuspend(NULL);
+        return; /* not reached; task torn down by the producer */
+    }
+
+    err = esp_ota_begin(part, OTA_SIZE_UNKNOWN, &handle);
+    ctx->err = err;
+    xSemaphoreGive(ctx->done);
+    if (err != ESP_OK) {
+        vTaskSuspend(NULL);
+        return;
+    }
+
+    for (;;) {
+        xSemaphoreTake(ctx->ready, portMAX_DELAY);
+        if (ctx->eof) {
+            break;
+        }
+        size_t len = ctx->len;
+        if (len > sizeof(s_ota_bounce)) len = sizeof(s_ota_bounce); /* safety clamp */
+        memcpy(s_ota_bounce, ctx->data, len);
+        if (!failed) {
+            err = esp_ota_write(handle, s_ota_bounce, len);
+            if (err != ESP_OK) failed = 1;
+        }
+        ctx->err = failed ? err : ESP_OK;
+        xSemaphoreGive(ctx->done);
+    }
+
+    if (!failed) {
+        err = esp_ota_end(handle);
+        if (err == ESP_OK) {
+            err = esp_ota_set_boot_partition(part);
+        }
+    } else {
+        esp_ota_abort(handle);
+        err = ctx->err; /* preserve the original write failure */
+    }
+    ctx->err = err;
+    xSemaphoreGive(ctx->done);
+
+    /* Do not self-delete: a task created with xTaskCreateWithCaps() must be
+     * torn down via vTaskDeleteWithCaps() from another task. */
+    vTaskSuspend(NULL);
+}
+
 static void ssh_session_task(void *arg)
 {
     int             client_fd      = (int)(intptr_t)arg;
@@ -361,7 +479,11 @@ static void ssh_session_task(void *arg)
      *   ssh <host> console (usb|com1|com2)   – serial bridge
      *   ssh <host> power   (1-6) (on|off)    – GPIO 4-9 output
      *   ssh <host> dcpower (on|off)           – DC Power (GPIO12)
+     *   ssh <host> powercycle                 – DC Power off->on (GPIO12)
      *   ssh <host> pwm     (1|2) (0-100)     – PWM GPIO 10-11
+     *   ssh <host> reboot                     – Reboot the ESP32-S3
+     *   ssh <host> update  < firmware.bin      – OTA firmware update
+     *                                            (e.g. cat app.bin | ssh host update)
      * ─────────────────────────────────────────────────────────────────────── */
     char cmd[16] = {0};
     char a1[32]  = {0};
@@ -649,6 +771,200 @@ static void ssh_session_task(void *arg)
         }
         goto cleanup;
 
+    } else if (strcmp(cmd, "powercycle") == 0) {
+        /* ssh <host> powercycle  — DC Power (GPIO12): off, wait, on */
+        char resp[96];
+        int r_off = ssh_gpio_set(6, 0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        int r_on  = ssh_gpio_set(6, 1);
+        if (r_off == 0 && r_on == 0) {
+            snprintf(resp, sizeof(resp), "DCPOWER (GPIO12) -> power cycled (OFF then ON)\r\n");
+        } else {
+            snprintf(resp, sizeof(resp), "Error: DCPOWER powercycle failed\r\n");
+        }
+        wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
+                               (const byte *)resp, (word32)strlen(resp));
+        goto cleanup;
+
+    } else if (strcmp(cmd, "reboot") == 0) {
+        /* ssh <host> reboot  — reboot the ESP32-S3 */
+        const char *resp = "Rebooting...\r\n";
+        wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
+                               (const byte *)resp, (word32)strlen(resp));
+        /* Close the SSH session cleanly before resetting. */
+        ssh_close_before_reboot(ssh, client_fd);
+        esp_restart();
+        /* not reached */
+        goto cleanup;
+
+    } else if (strcmp(cmd, "update") == 0) {
+        /* ssh <host> update  < firmware.bin  — OTA firmware update.
+         * Client pipes the app-only image (NOT the merged flash image) into
+         * the exec channel's stdin, e.g.:
+         *   cat app_<board>.bin | ssh admin@host update
+         * Data is streamed straight into the inactive OTA partition; once
+         * the client-side pipe reaches EOF the image is finalised, set as
+         * the next boot partition, and the device reboots.  On any error
+         * the write is aborted and the currently running firmware is left
+         * untouched.
+         *
+         * The actual esp_ota_*() calls run on a dedicated internal-RAM
+         * task (ota_worker_task) — see its comment for why: this session
+         * task's own stack lives in PSRAM, which flash writes can't
+         * tolerate. */
+        char resp[128];
+
+        ota_worker_ctx_t ota_ctx = {0};
+        ota_ctx.ready = xSemaphoreCreateBinary();
+        ota_ctx.done  = xSemaphoreCreateBinary();
+        if (!ota_ctx.ready || !ota_ctx.done) {
+            const char *err = "Error: failed to allocate OTA sync objects\r\n";
+            wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
+                                   (const byte *)err, (word32)strlen(err));
+            if (ota_ctx.ready) vSemaphoreDelete(ota_ctx.ready);
+            if (ota_ctx.done)  vSemaphoreDelete(ota_ctx.done);
+            goto cleanup;
+        }
+
+        TaskHandle_t ota_task_handle = NULL;
+        BaseType_t task_ret = xTaskCreateWithCaps(
+            ota_worker_task, "ota_worker", OTA_WORKER_STACK,
+            &ota_ctx, 5, &ota_task_handle, MALLOC_CAP_INTERNAL
+        );
+        if (task_ret != pdPASS) {
+            const char *err = "Error: failed to start OTA worker task\r\n";
+            wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
+                                   (const byte *)err, (word32)strlen(err));
+            vSemaphoreDelete(ota_ctx.ready);
+            vSemaphoreDelete(ota_ctx.done);
+            goto cleanup;
+        }
+
+        /* Wait for esp_ota_get_next_update_partition()/esp_ota_begin() to
+         * complete inside the worker before streaming any data. */
+        xSemaphoreTake(ota_ctx.done, portMAX_DELAY);
+        if (ota_ctx.err != ESP_OK) {
+            snprintf(resp, sizeof(resp),
+                     "Error: OTA initialisation failed (%d)\r\n", (int)ota_ctx.err);
+            wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
+                                   (const byte *)resp, (word32)strlen(resp));
+            vTaskDeleteWithCaps(ota_task_handle);
+            vSemaphoreDelete(ota_ctx.ready);
+            vSemaphoreDelete(ota_ctx.done);
+            goto cleanup;
+        }
+
+        ESP_LOGI(TAG, "OTA update starting -> partition '%s' at 0x%x",
+                 ota_ctx.partition->label, (unsigned)ota_ctx.partition->address);
+
+        {
+            int flags = fcntl(client_fd, F_GETFL, 0);
+            fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+            uint8_t buf[1024];
+            word32  lastChannel = 0;
+            size_t  total = 0;
+            int     ota_write_failed = 0;
+            WOLFSSH_CHANNEL *chan =
+                wolfSSH_ChannelFind(ssh, SHELL_CHANNEL_ID, WS_CHANNEL_ID_SELF);
+
+            while (1) {
+                fd_set rfds;
+                struct timeval tv = { .tv_sec = 0, .tv_usec = 10000 };
+                FD_ZERO(&rfds);
+                FD_SET(client_fd, &rfds);
+                int sel = select(client_fd + 1, &rfds, NULL, NULL, &tv);
+                if (sel < 0) {
+                    ESP_LOGI(TAG, "update: select() error errno=%d", errno);
+                    break;
+                }
+
+                rc = wolfSSH_worker(ssh, &lastChannel);
+                int wolf_err = wolfSSH_get_error(ssh);
+
+                if (rc == WS_CHAN_RXD && lastChannel == SHELL_CHANNEL_ID) {
+                    int n;
+                    while ((n = wolfSSH_ChannelIdRead(ssh, SHELL_CHANNEL_ID,
+                                                       buf, sizeof(buf))) > 0) {
+                        if (!ota_write_failed) {
+                            ota_ctx.data = buf;
+                            ota_ctx.len  = (size_t)n;
+                            ota_ctx.eof  = 0;
+                            xSemaphoreGive(ota_ctx.ready);
+                            xSemaphoreTake(ota_ctx.done, portMAX_DELAY);
+                            if (ota_ctx.err != ESP_OK) {
+                                ESP_LOGW(TAG, "esp_ota_write failed: %d", (int)ota_ctx.err);
+                                ota_write_failed = 1;
+                            } else {
+                                total += (size_t)n;
+                            }
+                        }
+                    }
+                    if (n < 0 && n != WS_WANT_READ) {
+                        ESP_LOGI(TAG, "update: ChannelIdRead err %d", n);
+                        break;
+                    }
+                } else if (rc == WS_SUCCESS   ||
+                           rc == WS_WANT_READ  ||
+                           rc == WS_WANT_WRITE ||
+                           rc == WS_CHAN_RXD    ||
+                           wolf_err == WS_WANT_READ  ||
+                           wolf_err == WS_WANT_WRITE) {
+                    /* transient, non-blocking socket */
+                } else {
+                    ESP_LOGI(TAG, "update: wolfSSH_worker ended rc=%d err=%d",
+                             rc, wolf_err);
+                    break;
+                }
+
+                if (chan && wolfSSH_ChannelGetEof(chan)) {
+                    ESP_LOGI(TAG, "update: client EOF, total=%u bytes", (unsigned)total);
+                    break;
+                }
+            }
+
+            /* Signal EOF so the worker finalises (esp_ota_end +
+             * esp_ota_set_boot_partition) or aborts, per ota_write_failed. */
+            ota_ctx.eof = 1;
+            xSemaphoreGive(ota_ctx.ready);
+            xSemaphoreTake(ota_ctx.done, portMAX_DELAY);
+
+            const esp_partition_t *update_partition = ota_ctx.partition;
+            esp_err_t final_err = ota_ctx.err;
+
+            vTaskDeleteWithCaps(ota_task_handle);
+            vSemaphoreDelete(ota_ctx.ready);
+            vSemaphoreDelete(ota_ctx.done);
+
+            if (ota_write_failed || total == 0) {
+                snprintf(resp, sizeof(resp),
+                         total == 0 ? "Error: no data received, OTA aborted\r\n"
+                                    : "Error: OTA write failed, aborted\r\n");
+                wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
+                                       (const byte *)resp, (word32)strlen(resp));
+                goto cleanup;
+            }
+
+            if (final_err != ESP_OK) {
+                snprintf(resp, sizeof(resp),
+                         "Error: OTA finalise failed (%d)\r\n", (int)final_err);
+                wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
+                                       (const byte *)resp, (word32)strlen(resp));
+                goto cleanup;
+            }
+
+            snprintf(resp, sizeof(resp),
+                     "OTA update OK: %u bytes written to '%s'. Rebooting...\r\n",
+                     (unsigned)total, update_partition->label);
+            wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
+                                   (const byte *)resp, (word32)strlen(resp));
+            /* Close the SSH session cleanly before resetting. */
+            ssh_close_before_reboot(ssh, client_fd);
+            esp_restart();
+            /* not reached */
+        }
+        goto cleanup;
+
     } else if (strcmp(cmd, "pwm") == 0) {
         /* ssh <host> pwm (1|2) (0-100) */
         int ch   = atoi(a1);
@@ -683,7 +999,10 @@ static void ssh_session_task(void *arg)
             "  ssh -tt admin@host console (usb|com1|com2)  -- Serial console bridge\r\n"
             "  ssh    admin@host power   (1-6) (on|off)    -- GPIO4-9 output control\r\n"
             "  ssh    admin@host dcpower (on|off)          -- DC Power output (GPIO12)\r\n"
+            "  ssh    admin@host powercycle                -- DC Power off->on (GPIO12)\r\n"
             "  ssh    admin@host pwm   (1|2) (0-100)       -- PWM GPIO10-11 duty %%\r\n"
+            "  ssh    admin@host reboot                    -- Reboot the ESP32-S3\r\n"
+            "  ssh    admin@host update < firmware.bin      -- OTA firmware update\r\n"
             "\r\n";
         wolfSSH_ChannelIdSend(ssh, SHELL_CHANNEL_ID,
                                (const byte *)usage, (word32)strlen(usage));

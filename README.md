@@ -542,7 +542,23 @@ ssh admin@192.168.2.200 dcpower off
 
 ---
 
-#### 4. PWM duty cycle control
+#### 4. DC Power power-cycle (GPIO12)
+
+Turns the DC Power output off, waits briefly, then turns it back on — in a single SSH call.
+
+```bash
+ssh <user>@<device_ip> powercycle
+```
+
+**Example:**
+
+```bash
+ssh admin@192.168.2.200 powercycle
+```
+
+---
+
+#### 5. PWM duty cycle control
 
 Sets the PWM duty cycle on GPIO10 or GPIO11 (LEDC, 1 kHz, 14-bit).
 
@@ -566,6 +582,59 @@ ssh admin@192.168.2.200 pwm 1 100   # GPIO10 → full on
 
 ---
 
+#### 6. Reboot the device
+
+Reboots the ESP32-S3 (equivalent to a power-on reset).
+
+```bash
+ssh <user>@<device_ip> reboot
+```
+
+**Example:**
+
+```bash
+ssh admin@192.168.2.200 reboot
+```
+
+---
+
+#### 7. OTA firmware update
+
+Streams a new app image over SSH directly into the inactive OTA partition, then
+reboots into it. No filesystem, SCP, or SFTP support is required — the exec
+channel's stdin is piped straight into flash.
+
+```bash
+ssh <user>@<device_ip> update < firmware.bin
+```
+
+**Example:**
+
+```bash
+cat flash_images/app_ssh-bridge-board.bin | ssh admin@192.168.2.200 update
+```
+
+**Important:**
+
+- Use the **app-only** image (`flash_images/app_<board>.bin`, produced by
+  `build-flash-images.sh`), **not** the merged full-flash image
+  (`flash_images/flash_<board>.bin`). The merged image includes the
+  bootloader and partition table baked in at offset 0 and will corrupt the
+  OTA partition if written this way.
+- The device has two OTA app slots (`ota_0`/`ota_1`). The update is written to
+  whichever slot isn't currently running, so the previous firmware is left
+  untouched until the new image is fully received and verified.
+- **Rollback safety:** the new image boots in a "pending verify" state. Once
+  the SSH bridge starts successfully it is marked valid automatically. If the
+  new firmware crashes or fails to boot before that point, the bootloader
+  automatically reverts to the previous working firmware on the next reset.
+- This requires the partition table to include `ota_0`/`ota_1`/`otadata`
+  (see `partitions.csv`). Boards flashed with an older single-partition image
+  must be reflashed once via USB/serial (`cargo espflash flash` or the merged
+  `flash_<board>.bin` image) before OTA updates over SSH will work.
+
+---
+
 ### Usage summary (printed on unknown command)
 
 ```
@@ -574,7 +643,10 @@ Usage:
   ssh -tt admin@host console (usb0|usb1|usb2|usb3|com1|com2)  -- Serial console bridge
   ssh    admin@host power   (1-6) (on|off)    -- GPIO4-9 output control
   ssh    admin@host dcpower (on|off)          -- DC Power output (GPIO12)
+  ssh    admin@host powercycle                -- DC Power off->on (GPIO12)
   ssh    admin@host pwm   (1|2) (0-100)       -- PWM GPIO10-11 duty %
+  ssh    admin@host reboot                    -- Reboot the ESP32-S3
+  ssh    admin@host update < firmware.bin      -- OTA firmware update
 ```
 
 ---

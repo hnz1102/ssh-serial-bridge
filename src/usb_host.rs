@@ -2100,6 +2100,13 @@ pub fn start(
         unsafe {
             let rc = ssh_bridge_init(22, user_cstr.as_ptr(), pass_cstr.as_ptr());
             log::info!("[SSH] SSH bridge init returned rc={}", rc);
+            if rc == 0 {
+                // Basic services are up — confirm this OTA image is good so the
+                // bootloader doesn't roll back to the previous firmware on the
+                // next reboot (see CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE and the
+                // SSH "update" command in components/ssh_bridge).
+                esp_idf_sys::esp_ota_mark_app_valid_cancel_rollback();
+            }
         }
         // The C code stores the raw pointer; keep the memory alive forever.
         std::mem::forget(user_cstr);
