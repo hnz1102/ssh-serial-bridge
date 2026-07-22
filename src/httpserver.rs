@@ -727,12 +727,27 @@ function saveConfig() {{
 }}
 function reboot() {{
   if (!confirm('Reboot the device?')) return;
-  fetch('/api/reboot', {{method: 'POST'}})
-  .then(() => {{
-    showMsg('Rebooting... redirecting to login in 3 seconds.', true);
-    setTimeout(() => {{ location.href = '/login'; }}, 3000);
-  }})
-  .catch(e => showMsg('Reboot request failed: ' + e, false));
+  // The device's WiFi occasionally drops for a second or two (AP-side
+  // roaming/beacon issues seen on some routers/extenders). If that happens
+  // to overlap with this click, the fetch fails and the request never
+  // reaches the device at all. Retry a few times with a short delay so a
+  // transient drop doesn't silently swallow the reboot request.
+  function attempt(retriesLeft) {{
+    fetch('/api/reboot', {{method: 'POST'}})
+    .then(() => {{
+      showMsg('Rebooting... redirecting to login in 3 seconds.', true);
+      setTimeout(() => {{ location.href = '/login'; }}, 3000);
+    }})
+    .catch(e => {{
+      if (retriesLeft > 0) {{
+        showMsg('Reboot request failed (' + e + '), retrying...', false);
+        setTimeout(() => attempt(retriesLeft - 1), 1500);
+      }} else {{
+        showMsg('Reboot request failed: ' + e, false);
+      }}
+    }});
+  }}
+  attempt(3);
 }}
 function resetDefaults() {{
   if (!confirm('Reset all settings to compile-time defaults and reload the page?')) return;
@@ -1215,22 +1230,56 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
     server.fn_handler("/api/reboot", Method::Post, move |request| {
         let cookie_hdr = request.header("Cookie").map(str::to_owned);
         if !is_auth(cookie_hdr.as_deref(), &state_rb.session) {
+            warn!("HTTP: /api/reboot rejected — not authenticated");
             request.into_status_response(401)?.write_all(b"Unauthorized")?;
             return Ok::<(), anyhow::Error>(());
         }
+        // Log receipt immediately — this line is the only way to tell, from the
+        // serial/syslog log, whether the reboot request actually reached the
+        // device at all (as opposed to being lost to a transient WiFi drop
+        // before it arrived, which looks identical from the browser's side).
+        info!("HTTP: /api/reboot received — rebooting in 500ms");
         // Clear session so the login page is shown after reconnect
         *state_rb.session.lock().unwrap() = None;
         request.into_ok_response()?.write_all(b"Rebooting...")?;
-        // Use Builder with explicit stack size — bare std::thread::spawn can
-        // silently fail on ESP-IDF when default stack is too small.
+        // Use Builder with an explicit, generous stack size. esp_restart() tears
+        // down WiFi/drivers/heap before resetting, which needs more than a
+        // couple KB of stack — 2048 was too small and caused a stack overflow
+        // (task watchdog is disabled via CONFIG_ESP_TASK_WDT_EN=n, so the
+        // corrupted task just hangs instead of forcing a reset, making the
+        // device appear to "not reboot" at all).
         let spawned = std::thread::Builder::new()
             .name("reboot".into())
-            .stack_size(2048)
+            .stack_size(8192)
             .spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(500));
+                // Safety net: esp_restart()'s graceful shutdown handlers (WiFi
+                // stop, netif teardown, etc.) can hang if they race with an
+                // HTTP server / WebSocket connection that's still tearing
+                // itself down on another task (observed in the field: WiFi
+                // teardown logs + WS "removed sender"/"connection closed"
+                // logs complete, then the device silently never resets).
+                // CONFIG_ESP_TASK_WDT_EN=n means no watchdog is running by
+                // default, so a stuck shutdown handler would hang forever.
+                // Arm the Task Watchdog Timer just for this task with
+                // trigger_panic=true: if esp_restart() hasn't completed
+                // (i.e. actually reset the chip) within 5s, the TWDT fires a
+                // panic, and CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y forces an
+                // immediate hardware reboot regardless of what's stuck.
+                unsafe {
+                    let wdt_config = esp_task_wdt_config_t {
+                        timeout_ms: 5000,
+                        idle_core_mask: 0,
+                        trigger_panic: true,
+                    };
+                    esp_task_wdt_init(&wdt_config);
+                    esp_task_wdt_add(core::ptr::null_mut());
+                }
+                println!("HTTP: /api/reboot — calling esp_restart() now");
                 unsafe { esp_restart(); }
             });
         if spawned.is_err() {
+            warn!("HTTP: /api/reboot — thread spawn failed, rebooting from request thread");
             // Fallback: reboot directly if thread spawn failed
             std::thread::sleep(std::time::Duration::from_millis(200));
             unsafe { esp_restart(); }
