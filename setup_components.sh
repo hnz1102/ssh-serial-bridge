@@ -47,6 +47,18 @@ mkdir -p "${COMP_DIR}"
 clone_or_update "wolfssh" "${WOLFSSH_REPO}" "${WOLFSSH_COMMIT}"
 clone_or_update "wolfssl" "${WOLFSSL_REPO}" "${WOLFSSL_COMMIT}"
 
+# ─── sdkconfig.defaults: set absolute partition table path ──────────────────
+# esp-idf-sys builds from a synthetic out-of-tree CMake project, so
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME is NOT resolved relative to this
+# repo — it must be an absolute path. Rewrite it here to match wherever this
+# repo actually lives, so the build works regardless of checkout location.
+
+SDKCONFIG_DEFAULTS="${SCRIPT_DIR}/sdkconfig.defaults"
+PARTITIONS_CSV="${SCRIPT_DIR}/partitions.csv"
+
+echo "[sdkconfig] Setting CONFIG_PARTITION_TABLE_CUSTOM_FILENAME to ${PARTITIONS_CSV} ..."
+sed -i -E "s|^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\".*\"|CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"${PARTITIONS_CSV}\"|" "${SDKCONFIG_DEFAULTS}"
+
 # ─── overlay: components/wolfssh/CMakeLists.txt ──────────────────────────────
 
 echo "[wolfssh] Writing CMakeLists.txt ..."
@@ -378,6 +390,8 @@ echo ""
 echo "Done. Components are ready under ${COMP_DIR}/"
 echo "  wolfssh : ${WOLFSSH_COMMIT:0:10}  (${WOLFSSH_REPO})"
 echo "  wolfssl : ${WOLFSSL_COMMIT:0:10}  (${WOLFSSL_REPO})"
+echo "sdkconfig.defaults CONFIG_PARTITION_TABLE_CUSTOM_FILENAME set to:"
+echo "  ${PARTITIONS_CSV}"
 echo "Static files are ready under ${STATIC_DIR}/"
 echo "  @xterm/xterm     : ${XTERM_VERSION}"
 echo "  @xterm/addon-fit : ${ADDON_FIT_VERSION}"
