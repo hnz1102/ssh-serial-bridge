@@ -12,7 +12,13 @@ CONFIG_SPIRAM_SUPPORT=y
 CONFIG_ESP32S3_SPIRAM_SUPPORT=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP_TASK_WDT_EN=y
+# Keep automatic startup init OFF (do not watch idle tasks by default) — the
+# task_wdt component is only compiled in so that /api/reboot's handler can
+# manually esp_task_wdt_init()/esp_task_wdt_add() as a safety net right
+# before esp_restart(), forcing a real hardware reset if esp_restart()'s
+# internal shutdown-handler sequence ever hangs. See httpserver.rs.
+CONFIG_ESP_TASK_WDT_INIT=n
 CONFIG_HTTPD_MAX_URI_LEN=1024
 CONFIG_HTTPD_WS_SUPPORT=y
 CONFIG_SPIRAM_USE=y

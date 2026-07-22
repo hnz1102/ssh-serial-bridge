@@ -128,6 +128,16 @@ impl SysLogger {
             message,
         );
 
+        // Always echo to the local console too. Previously this logger only
+        // wrote to the remote UDP syslog server, so once the server became
+        // unreachable (Wi-Fi drop, wrong static IP, etc.) every log::info!/
+        // warn!/error! call in the app became completely invisible on the
+        // serial console — only a content-less "Failed to send..." line
+        // remained, making it impossible to diagnose what was actually
+        // happening (e.g. whether the WiFi monitor thread was retrying,
+        // whether a reboot request had been received, etc.).
+        println!("{}", message);
+
         // Send the message to the syslog server - using sendto instead of send
         // to avoid connection issues
         match self.socket.send_to(formatted_message.as_bytes(), &self.server_addr) {
