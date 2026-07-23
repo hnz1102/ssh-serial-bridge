@@ -103,13 +103,35 @@ static WS_FD_PORT_MAP: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Per-port ring buffers for WS data (RX paths write here, sender thread drains).
-const WS_RING_CAP: usize = 65536;
+/// Buffer size increased from 65536 to 262144 bytes (256 KB) to handle high-volume
+/// boot-phase logs (~2-5 MB/s from systemd startup) without dropping data.
+const WS_RING_CAP: usize = 262144;
 static WS_RING_COM1: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_RING_COM2: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_RING_USB:  std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_RING_USB1: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_RING_USB2: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 static WS_RING_USB3: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
+
+/// Per-port overflow drop counters for diagnostics (bytes discarded when ring was full).
+/// AtomicU32 used instead of AtomicU64 — Xtensa (ESP32-S3) lacks native 64-bit atomics.
+static WS_DROPS_COM1: AtomicU32 = AtomicU32::new(0);
+static WS_DROPS_COM2: AtomicU32 = AtomicU32::new(0);
+static WS_DROPS_USB:  AtomicU32 = AtomicU32::new(0);
+static WS_DROPS_USB1: AtomicU32 = AtomicU32::new(0);
+static WS_DROPS_USB2: AtomicU32 = AtomicU32::new(0);
+static WS_DROPS_USB3: AtomicU32 = AtomicU32::new(0);
+
+fn ws_drops_counter(device_id: u8) -> &'static AtomicU32 {
+    match device_id {
+        DEVICE_COM1 => &WS_DROPS_COM1,
+        DEVICE_COM2 => &WS_DROPS_COM2,
+        DEVICE_USB1 => &WS_DROPS_USB1,
+        DEVICE_USB2 => &WS_DROPS_USB2,
+        DEVICE_USB3 => &WS_DROPS_USB3,
+        _ => &WS_DROPS_USB,
+    }
+}
 
 fn ws_senders_for(device_id: u8) -> &'static std::sync::Mutex<Vec<(i32, EspHttpWsDetachedSender)>> {
     match device_id {
@@ -193,12 +215,18 @@ pub fn ws_port_for_fd(fd: i32) -> &'static str {
 /// Called from bulk_in_cb and uart_rx_thread — must never block on httpd.
 fn ws_enqueue(device_id: u8, data: &[u8]) {
     if let Ok(mut ring) = ws_ring_for(device_id).try_lock() {
+        let mut dropped = 0usize;
         for &b in data {
             if ring.len() >= WS_RING_CAP {
                 // Drop oldest bytes on overflow
                 ring.pop_front();
+                dropped += 1;
             }
             ring.push_back(b);
+        }
+        if dropped > 0 {
+            ws_drops_counter(device_id).fetch_add(dropped as u32, Ordering::Relaxed);
+            warn!("[WS] ring overflow on device {}: dropped {} bytes", device_id, dropped);
         }
     }
     // If lock is contended, silently drop — sender thread holds it briefly.
@@ -236,12 +264,14 @@ fn ws_drain_and_send(device_id: u8) {
 }
 
 /// Background thread: drains per-port WS ring buffers and sends to clients.
-/// Also drains TX queues (browser→serial). Runs ~200 Hz so latency is ≤5 ms.
+/// Also drains TX queues (browser→serial). Runs ~1000 Hz (1ms interval) to keep up
+/// with high-volume serial data during device boot (systemd startup ~2-5 MB/s).
 pub fn start_ws_sender_thread() {
     thread::Builder::new()
         .name("ws_send".into())
         .stack_size(6144)
         .spawn(move || {
+            let mut cycle_counter = 0u32;
             loop {
                 ws_drain_and_send(DEVICE_COM1);
                 ws_drain_and_send(DEVICE_COM2);
@@ -255,7 +285,26 @@ pub fn start_ws_sender_thread() {
                 ws_drain_tx(DEVICE_USB1);
                 ws_drain_tx(DEVICE_USB2);
                 ws_drain_tx(DEVICE_USB3);
-                thread::sleep(Duration::from_millis(5));
+                
+                // Every ~100 cycles (~100ms), log any overflow statistics
+                cycle_counter += 1;
+                if cycle_counter >= 100 {
+                    cycle_counter = 0;
+                    let drops = [
+                        WS_DROPS_COM1.load(Ordering::Relaxed),
+                        WS_DROPS_COM2.load(Ordering::Relaxed),
+                        WS_DROPS_USB.load(Ordering::Relaxed),
+                        WS_DROPS_USB1.load(Ordering::Relaxed),
+                        WS_DROPS_USB2.load(Ordering::Relaxed),
+                        WS_DROPS_USB3.load(Ordering::Relaxed),
+                    ];
+                    if drops.iter().any(|&d| d > 0) {
+                        warn!("[WS] total drops: COM1={} COM2={} USB={} USB1={} USB2={} USB3={}",
+                              drops[0], drops[1], drops[2], drops[3], drops[4], drops[5]);
+                    }
+                }
+                
+                thread::sleep(Duration::from_millis(1));
             }
         })
         .expect("spawn ws_sender thread");
