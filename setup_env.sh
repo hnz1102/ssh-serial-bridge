@@ -4,11 +4,30 @@
 set -euo pipefail
 
 echo "=== [1/6] Installing system packages ==="
+
+# Detect distro-specific package names
+# shellcheck source=/dev/null
+. /etc/os-release
+# libtinfo: Ubuntu 22.04 and older ship libtinfo5; Debian trixie / Ubuntu 24.04+ ship libtinfo6
+if apt-cache show libtinfo6 &>/dev/null; then
+    LIBTINFO_PKG="libtinfo6"
+else
+    LIBTINFO_PKG="libtinfo5"
+fi
+# python3-venv: Debian uses the unversioned package; Ubuntu requires the versioned one
+if [[ "${ID:-}" == "ubuntu" ]]; then
+    PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    PYTHON_VENV_PKG="python${PY_VER}-venv"
+else
+    PYTHON_VENV_PKG="python3-venv"
+fi
+echo "Detected: ID=${ID:-unknown}, libtinfo=${LIBTINFO_PKG}, venv=${PYTHON_VENV_PKG}"
+
 sudo apt update
 sudo apt -y install \
     git python3 python3-pip gcc build-essential curl \
-    pkg-config libudev-dev libtinfo5 clang libclang-dev \
-    llvm-dev udev libssl-dev python3.10-venv
+    pkg-config libudev-dev "${LIBTINFO_PKG}" clang libclang-dev \
+    llvm-dev udev libssl-dev "${PYTHON_VENV_PKG}"
 
 echo "=== [2/6] Installing Rust (rustup) ==="
 if command -v rustup &>/dev/null; then
@@ -34,7 +53,10 @@ cargo +stable install espup
 cargo +stable install cargo-espflash
 
 echo "=== [4/6] Installing ESP32-S3 toolchain via espup ==="
+# Remove stale symlink that causes "File exists (os error 17)" on both install and update
+rm -f "$HOME/.espup/esp-clang"
 espup install
+rm -f "$HOME/.espup/esp-clang"
 espup update
 
 echo "=== [5/6] Sourcing ESP-IDF environment ==="
