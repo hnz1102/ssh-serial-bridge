@@ -667,26 +667,23 @@ pub extern "C" fn ssh_device_error() -> *const u8 {
     err.as_ptr()
 }
 
-/// Submit a USB bulk-OUT transfer on the given port.
-/// Drops silently if a transfer is already in flight on that port.
-unsafe fn usb_cdc_write_port(port: usize, data: *const u8, len: usize) {
-    if port >= MAX_USB_PORTS { return; }
-    let dev_hdl = CDC_DEV_HDL.load(Ordering::Acquire) as usb_device_handle_t;
-    if dev_hdl.is_null() { return; }
-    if len == 0 { return; }
-
+/// Submit a single USB bulk-OUT transfer (at most `data_buffer_size` bytes)
+/// on the given port. Returns the number of bytes actually queued for
+/// transmission, or 0 if the port is busy / unavailable / the submit failed.
+/// Caller (`usb_cdc_write_port`) is responsible for looping over the rest.
+unsafe fn usb_cdc_submit_chunk(port: usize, dev_hdl: usb_device_handle_t, data: *const u8, len: usize) -> usize {
     // Atomically claim the OUT slot for this port
     if CDC_PORT_OUT_BUSY[port]
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
         .is_err()
     {
-        return; // Previous transfer still pending — drop this packet
+        return 0; // Previous transfer still pending — caller should retry later
     }
 
     let xfer = CDC_PORT_OUT_XFER[port];
     if xfer.is_null() {
         CDC_PORT_OUT_BUSY[port].store(false, Ordering::Release);
-        return;
+        return 0;
     }
 
     let max = (*xfer).data_buffer_size;
@@ -712,7 +709,60 @@ unsafe fn usb_cdc_write_port(port: usize, data: *const u8, len: usize) {
                 warn!("[USB] bulk-OUT submit failed (port {}): 0x{:x}", port, ret2);
             }
             CDC_PORT_OUT_BUSY[port].store(false, Ordering::Release);
+            return 0;
         }
+    }
+    copy_len
+}
+
+/// Write `len` bytes to a USB CDC port, splitting into multiple bulk-OUT
+/// transfers as needed (each transfer is limited to the endpoint's max
+/// packet size). Blocks the calling thread (briefly, with a bounded
+/// timeout) between chunks while waiting for the previous transfer to
+/// complete — this runs on the SSH session task / ws_sender_thread, never
+/// on the USB client-event task, so it cannot deadlock the completion
+/// callback (`bulk_out_cb`) that clears the busy flag.
+///
+/// Previously this only submitted a single `data_buffer_size`-sized chunk
+/// and silently discarded the remainder, which truncated any paste/write
+/// larger than one USB packet (typically 64 bytes) and could leave the
+/// remote shell waiting on a half-received line (requiring Ctrl-C to
+/// recover).
+unsafe fn usb_cdc_write_port(port: usize, data: *const u8, len: usize) {
+    if port >= MAX_USB_PORTS { return; }
+    if len == 0 { return; }
+
+    let mut sent = 0usize;
+    while sent < len {
+        let dev_hdl = CDC_DEV_HDL.load(Ordering::Acquire) as usb_device_handle_t;
+        if dev_hdl.is_null() { return; } // device gone — drop the rest
+
+        let xfer = CDC_PORT_OUT_XFER[port];
+        if xfer.is_null() { return; }
+
+        // Wait (bounded) for any in-flight transfer on this port to finish
+        // before submitting the next chunk.
+        let mut waited_ms = 0u32;
+        while CDC_PORT_OUT_BUSY[port].load(Ordering::Acquire) {
+            if waited_ms >= 200 {
+                // Device likely stalled/unresponsive — give up on this write
+                // rather than hanging the calling task indefinitely.
+                warn!("[USB] bulk-OUT wait timeout (port {}), dropping {} remaining bytes",
+                      port, len - sent);
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+            waited_ms += 1;
+        }
+
+        let n = usb_cdc_submit_chunk(port, dev_hdl, data.add(sent), len - sent);
+        if n == 0 {
+            // Lost the race for the busy slot or submit failed — retry
+            // shortly rather than dropping data.
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        sent += n;
     }
 }
 
